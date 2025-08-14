@@ -38,6 +38,7 @@ void ACHIComponent::setup() {
 
   // ----- Text sensor -----
   this->power_text_ = new text_sensor::TextSensor();
+  this->power_text_->set_internal(false);
   this->power_text_->set_name((this->name_prefix_ + " Power Status").c_str());
   App.register_text_sensor(this->power_text_);
   this->power_text_->publish_state("OFF");
@@ -47,6 +48,7 @@ void ACHIComponent::setup() {
                           const char *uom = nullptr, const char *dev_class = nullptr,
                           sensor::StateClass st = sensor::STATE_CLASS_MEASUREMENT) {
     ptr = new sensor::Sensor();
+    ptr->set_internal(false);
     ptr->set_name((this->name_prefix_ + " " + name).c_str());
     ptr->set_accuracy_decimals(acc);
     if (uom != nullptr) ptr->set_unit_of_measurement(uom);
@@ -73,6 +75,7 @@ void ACHIComponent::setup() {
   // ----- Switches -----
   auto mk_switch = [this](ACHISwitch *&ptr, ControlType type, const std::string &name) {
     ptr = new ACHISwitch();
+    ptr->set_internal(false);
     ptr->set_parent(this);
     ptr->set_type(type);
     ptr->set_name((this->name_prefix_ + " " + name).c_str());
@@ -89,6 +92,7 @@ void ACHIComponent::setup() {
 
   // ----- Number (setpoint) -----
   this->temp_num_ = new ACHINumber();
+  this->temp_num_->set_internal(false);
   this->temp_num_->set_parent(this);
   this->temp_num_->set_type(CTRL_TEMP);
   this->temp_num_->traits.set_min_value(18.0f);
@@ -101,6 +105,7 @@ void ACHIComponent::setup() {
   auto mk_select = [this](ACHISelect *&ptr, ControlType type, const std::string &name,
                           const std::vector<std::string> &options) {
     ptr = new ACHISelect();
+    ptr->set_internal(false);
     ptr->set_parent(this);
     ptr->set_type(type);
     ptr->traits.set_options(options);
@@ -129,40 +134,35 @@ void ACHIComponent::update() {
   }
 }
 
-// --- неблокирующий loop() ---
+// --- неблокирующий loop(): читаем только доступное, обрабатываем 1 кадр ---
 void ACHIComponent::loop() {
-  // читаем только то, что уже есть в буфере UART — без ожиданий/таймаутов
   size_t avail = this->available();
   if (avail == 0) return;
 
-  // ограничим за один заход, чтобы не «жевать» слишком много за цикл
-  size_t chunk = avail > 96 ? 96 : avail;
-
+  size_t chunk = avail > 64 ? 64 : avail;  // ограничим время цикла
   for (size_t i = 0; i < chunk; i++) {
     uint8_t b;
-    if (!this->read_byte(&b)) break;  // не должно блокировать, т.к. avail > 0
+    if (!this->read_byte(&b)) break;  // non-blocking, т.к. avail > 0
     rx_.push_back(b);
   }
 
-  // быстрый разбор: обрабатываем максимум ОДИН полный кадр за один вызов loop()
-  // (это держит время выполнения маленьким и стабильным)
-  // ищем начало
+  // найти начало
   size_t start = 0;
   while (start + 1 < rx_.size() && !(rx_[start] == START0 && rx_[start + 1] == START1)) start++;
   if (start + 1 >= rx_.size()) {
-    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);  // выбросить мусор слева
+    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
     return;
   }
 
-  // ищем конец
+  // найти конец
   size_t end = start + 2;
   while (end + 1 < rx_.size() && !(rx_[end] == END0 && rx_[end + 1] == END1)) end++;
   if (end + 1 >= rx_.size()) {
-    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);  // оставим хвост с начала кадра
+    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
     return;
   }
 
-  // есть полный кадр [start..end+1] — обработать и удалить
+  // обработать 1 полный кадр [start..end+1]
   std::vector<uint8_t> frame(rx_.begin() + start, rx_.begin() + end + 2);
   this->handle_frame_(frame);
   rx_.erase(rx_.begin(), rx_.begin() + end + 2);
@@ -402,7 +402,6 @@ void ACHIComponent::build_write_frame_() {
     this->frame_[33] = this->turbo_bin_;
     this->frame_[35] = 0;
   }
-  // Restore after turbo off: оставляем temp как есть
 
   // Quiet overrides turbo & eco when active
   if (this->quiet_bin_ == 48) {

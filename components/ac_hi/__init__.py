@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome.components import uart
 from esphome.const import CONF_ID
 
-# ВАЖНО: как в примерах — объявляем зависимости и автоподгрузку
+# важно: эти модули нужны для сборки C++ заголовков
 DEPENDENCIES = ["uart"]
 AUTO_LOAD = ["sensor", "switch", "text_sensor", "number", "select"]
 
@@ -19,13 +19,12 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_NAME_PREFIX, default="Hisense AC"): cv.string,
         }
     )
-    .extend(cv.polling_component_schema("1s"))   # как в empty_uart_sensor
-    .extend(uart.UART_DEVICE_SCHEMA)             # как в empty_uart_component
+    .extend(cv.polling_component_schema("1s"))   # интервал опроса FSM
+    .extend(uart.UART_DEVICE_SCHEMA)             # параметры UART
 )
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
-    # Пробрасываем только параметры — всё остальное делается в C++
     cg.add(var.set_name_prefix(config[CONF_NAME_PREFIX]))
