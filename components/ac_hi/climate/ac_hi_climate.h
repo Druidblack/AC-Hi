@@ -1,5 +1,6 @@
-#pragma once
 // SPDX-License-Identifier: MIT
+#pragma once
+
 #include "esphome/core/component.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/uart/uart.h"
@@ -17,7 +18,7 @@ namespace ac_hi {
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
-  void set_status_update_interval(uint32_t ms) { update_interval_ms_ = ms; }
+  void set_update_interval(uint32_t ms) { update_interval_ms_ = ms; }
 
   void setup() override;
   void loop() override;
@@ -49,11 +50,11 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   bool eco_{false};
   bool led_{false};
 
-  // write-intent fields
-  uint8_t power_bin_{0x04};      // база (bit2); включение добавляет bit3
+  // write-intent fields (match legacy encoding)
+  uint8_t power_bin_{0x04};      // base (bit2); ON adds bit3
   uint8_t mode_bin_{0x10};       // ((idx<<1)|1)<<4
-  uint8_t wind_code_{0x00};      // 0..18, в запись уходит +1
-  uint8_t temp_byte_{0x00};      // ((°C)<<1)|1  или 0 при turbo override
+  uint8_t wind_code_{0x01};      // 1=auto; low/med/high -> 12/14/16 (status uses raw; write uses +1)
+  uint8_t temp_byte_{0x00};      // ((°C)<<1)|1, or 0 when turbo override
   uint8_t updown_bin_{0x10};     // 0x30 on, 0x10 off -> [32]
   uint8_t leftright_bin_{0x04};  // 0x0C on, 0x04 off -> [32]
   uint8_t turbo_bin_{0x04};      // 0x0C on, 0x04 off -> [33]

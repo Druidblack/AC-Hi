@@ -13,26 +13,26 @@ void ACHiClimate::setup() {
   ESP_LOGI(TAG, "Init climate over RS-485");
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 
-  // Build outbound template once
+  // Build outbound template once (matches legacy long write frame)
   this->out_.assign(50, 0x00);
-  // Header & footer per legacy
+  // Header & footer
   this->out_[0] = 0xF4; this->out_[1] = 0xF5;
-  this->out_[2] = 0x00;           // addr/flag как в legacy-трафике
+  this->out_[2] = 0x00;           // addr/flag as in captured traffic
   this->out_[3] = 0x40;
-  this->out_[4] = 0x29;           // тип длинного пакета записи, используемый в legacy
-  this->out_[8] = 0x01;           // служебные константы, встречающиеся в дампах
+  this->out_[4] = 0x29;           // long write packet type used in legacy
+  this->out_[8] = 0x01;           // service constants observed in dumps
   this->out_[9] = 0xFE;
   this->out_[10] = 0x00;
   this->out_[11] = 0x00;
   this->out_[12] = 0x00;
-  this->out_[13] = 0x65;          // 101 — команда записи/применения (ожидается unlock 101)
+  this->out_[13] = 0x65;          // 101 — write/apply (unlock follows)
   // bytes [46],[47] — CRC, [48]=0xF4, [49]=0xFB
   this->out_[48] = 0xF4; this->out_[49] = 0xFB;
 
-  // default visual bounds
+  // Visual default
   this->target_temperature = 24;
 
-  // request first status soon
+  // Request first status soon
   this->set_timeout("init_status", 1000, [this]() { this->send_status_request_(); });
 }
 
@@ -95,7 +95,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
-      power_bin_ = 0b00000100; // держим bit2, чистим bit3
+      power_bin_ = 0b00000100; // keep bit2, clear bit3
       this->mode = climate::CLIMATE_MODE_OFF;
       this->power_ = false;
     } else {
@@ -125,11 +125,11 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
   if (call.get_fan_mode().has_value()) {
     auto f = *call.get_fan_mode();
     this->fan_mode = f;
-    // map to код ветра
-    if (f == climate::CLIMATE_FAN_AUTO)      wind_code_ = 1;
-    else if (f == climate::CLIMATE_FAN_LOW)  wind_code_ = 12;
+    // map to wind code used by protocol
+    if (f == climate::CLIMATE_FAN_AUTO)        wind_code_ = 1;
+    else if (f == climate::CLIMATE_FAN_LOW)    wind_code_ = 12;
     else if (f == climate::CLIMATE_FAN_MEDIUM) wind_code_ = 14;
-    else if (f == climate::CLIMATE_FAN_HIGH) wind_code_ = 16;
+    else if (f == climate::CLIMATE_FAN_HIGH)   wind_code_ = 16;
     need_write = true;
   }
 
@@ -150,16 +150,18 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 // ======================= Protocol I/O =======================
 
 void ACHiClimate::send_status_request_() {
-  // короткий запрос статуса (cmd 0x66 / 102): снят из legacy
-  const uint8_t req[] = {0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB};
+  // Short status request (cmd 0x66 / 102) from legacy
+  const uint8_t req[] = {
+    0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
+  };
   this->write_array(req, sizeof(req));
   this->flush();
   ESP_LOGVV(TAG, "Sent status request (102)");
 }
 
 void ACHiClimate::rebuild_write_frame_() {
-  // переносим «намерения» в байты пакета
-  // [16] wind (протокол просит +1)
+  // Apply write-intent to the outbound frame
+  // [16] wind (protocol requires +1)
   out_[16] = uint8_t(wind_code_ + 1);
   // [18] power + mode
   out_[18] = uint8_t(power_bin_ + mode_bin_);
@@ -171,10 +173,10 @@ void ACHiClimate::rebuild_write_frame_() {
   out_[33] = uint8_t(turbo_bin_ + eco_bin_);
   // [35] quiet
   out_[35] = quiet_bin_;
-  // [19] целевая температура (0 — при turbo override)
+  // [19] target temp (0 — when turbo override)
   out_[19] = (turbo_bin_ == 0b00001100) ? 0x00 : temp_byte_;
 
-  // Явно чистим бит питания (bit3) при OFF, как делалось в legacy
+  // Explicitly clear power bit3 on OFF, as done in legacy
   if ((power_bin_ & 0b00001000) == 0) {
     out_[18] = uint8_t(out_[18] & (~(1U<<3)));
   }
@@ -186,11 +188,11 @@ void ACHiClimate::send_write_frame_() {
   this->rebuild_write_frame_();
   this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGD(TAG, "Sent write frame (ожидается unlock 101)");
+  ESP_LOGD(TAG, "Sent write frame (expect unlock 101)");
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
-  // CRC как в legacy: сумма байт с 2 по size-5, в [46],[47]; хвост [48]=F4, [49]=FB
+  // CRC as in legacy: sum bytes [2..size-5] -> [46],[47]; tail [48]=F4, [49]=FB
   if (buf.size() < 50) return;
   int csum = 0;
   for (size_t i = 2; i < buf.size() - 4; i++) csum += buf[i];
@@ -202,7 +204,7 @@ void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
   buf[49] = 0xFB;
 }
 
-// парсер: кадры начинаются F4 F5 и закрываются F4 FB
+// Frames start with F4 F5 and end with F4 FB
 bool ACHiClimate::parse_next_frame_() {
   // sync to start
   size_t cnt = 0;
@@ -225,7 +227,7 @@ bool ACHiClimate::parse_next_frame_() {
         }
         return false;
       } else {
-        // откат b2
+        // put back b2
         rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE;
       }
     }
@@ -237,15 +239,15 @@ bool ACHiClimate::parse_next_frame_() {
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 46) return;
 
-  // интересуют только пакеты cmd=102 (статус)
+  // We only care about cmd=102 (status)
   if (bytes[13] != 102) {
-    // 101 — unlock после записи
+    // 101 — unlock after write; ignore here
     return;
   }
 
-  // Power (bit3 в [18])
+  // Power (bit3 in [18])
   bool new_power = (bytes[18] & 0b00001000) != 0;
-  // Mode — старший ниббл [18]
+  // Mode — high nibble of [18]
   uint8_t mode_raw = (bytes[18] >> 4) & 0x0F;
   climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
   switch (mode_raw) {
@@ -256,19 +258,24 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     default: new_mode = climate::CLIMATE_MODE_AUTO;    break;
   }
 
-  // Вентилятор — [16]
+  // Fan — [16]
   uint8_t wind_raw = bytes[16];
   climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
-  if (wind_raw == 10) new_fan = climate::CLIMATE_FAN_LOW;
-  else if (wind_raw == 12) new_fan = climate::CLIMATE_FAN_MEDIUM;
-  else if (wind_raw == 14) new_fan = climate::CLIMATE_FAN_HIGH;
+  if (wind_raw == 12) new_fan = climate::CLIMATE_FAN_LOW;
+  else if (wind_raw == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
+  else if (wind_raw == 16) new_fan = climate::CLIMATE_FAN_HIGH;
   else if (wind_raw == 1)  new_fan = climate::CLIMATE_FAN_AUTO;
 
-  // Температуры — уставка и текущая
+  // Temperatures — setpoint and current
   uint8_t tset = bytes[19];
   uint8_t tcur = bytes[20];
 
-  // Флаги
+  // Flags
+  // quiet: [36] & 0b00000100
+  // turbo: [35] & 0b00000010
+  // eco:   [35] & 0b00000100
+  // led:   [37] & 0b10000000
+  // swing: [35] up/down 0b10000000, left/right 0b01000000
   bool quiet = (bytes[36] & 0b00000100) != 0;
   bool turbo = (bytes[35] & 0b00000010) != 0;
   bool eco   = (bytes[35] & 0b00000100) != 0;
@@ -276,14 +283,14 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   bool ud    = (bytes[35] & 0b10000000) != 0;
   bool lr    = (bytes[35] & 0b01000000) != 0;
 
-  // Публикуем в Climate
+  // Publish into Climate
   this->current_temperature = float(tcur);
   this->target_temperature  = float(tset);
   this->mode      = new_power ? new_mode : climate::CLIMATE_MODE_OFF;
   this->fan_mode  = new_fan;
   this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
 
-  // зеркалим во внутреннее состояние
+  // Mirror to internal state
   this->power_ = new_power;
   this->mode_  = new_mode;
   this->fan_   = new_fan;
