@@ -70,7 +70,7 @@ CONFIG_SCHEMA = cv.Schema({
 
     cv.Optional(CONF_TEMP_SET):
         sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-
+    
     # External (template) entities passed by id
     cv.Optional(CONF_AC_WIND_SELECT): cv.use_id(select.Select),
     cv.Optional(CONF_AC_SLEEP_SELECT): cv.use_id(select.Select),
@@ -91,12 +91,9 @@ async def to_code(config):
     await uart.register_uart_device(var, config)
 
     if CONF_AC_MODE_SELECT in config:
-        conf = config[CONF_AC_MODE_SELECT]
-        sel = await select.new_select(conf, options=["fan_only", "heat", "cool", "dry", "auto"])
+        sel = await cg.get_variable(config[CONF_AC_MODE_SELECT])
         cg.add(var.set_mode_select(sel))
 
-
-    
     # Bind external controls (template entities) by id if provided
     if CONF_AC_WIND_SELECT in config:
         s = await cg.get_variable(config[CONF_AC_WIND_SELECT])
