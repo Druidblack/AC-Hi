@@ -10,13 +10,14 @@ static const char *const TAG = "ac_hi.climate";
 
 void ACHiClimate::setup() {
   // проверка UART-конфигурации (9600 8N1)
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);  // api docs: UARTDevice::check_uart_settings
+  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
+
   // стартовое состояние
   this->target_temperature = target_temp_;
   this->mode = climate::CLIMATE_MODE_OFF;
-  this->fan_mode = climate::CLIMATE_FAN_AUTO;   // фан пока только авто (безопасно для приёма)
+  this->fan_mode = climate::CLIMATE_FAN_AUTO;   // фан пока только авто
   this->swing_mode = climate::CLIMATE_SWING_OFF;
-  this->publish_state(); // уведомить HA
+  this->publish_state();
 }
 
 void ACHiClimate::dump_config() {
@@ -34,7 +35,6 @@ climate::ClimateTraits ACHiClimate::traits() {
       climate::CLIMATE_MODE_AUTO,
       climate::CLIMATE_MODE_FAN_ONLY,
   });
-  // чтобы не рисковать при записи, оставляем управляемую скорость только AUTO
   t.set_supported_fan_modes({ climate::CLIMATE_FAN_AUTO });
   t.set_supported_swing_modes({
       climate::CLIMATE_SWING_OFF,
@@ -53,14 +53,27 @@ void ACHiClimate::loop() {
     rx_buf_.push_back(b);
   }
 
-  // парсим по хвосту F4 FB
-  const uint8_t tail[2] = {0xF4, 0xFB};
+  // Устойчивый парсер: ищем сначала F4 F5 (старт), затем F4 FB (хвост)
+  const uint8_t HEAD[2] = {0xF4, 0xF5};
+  const uint8_t TAIL[2] = {0xF4, 0xFB};
   for (;;) {
-    auto it_tail = std::search(rx_buf_.begin() + 2, rx_buf_.end(), std::begin(tail), std::end(tail));
-    if (it_tail == rx_buf_.end()) break;
-    std::vector<uint8_t> frame(rx_buf_.begin(), it_tail + 2);
+    // найти заголовок
+    auto it_head = std::search(rx_buf_.begin(), rx_buf_.end(), std::begin(HEAD), std::end(HEAD));
+    if (it_head == rx_buf_.end()) { // мусор до заголовка — выбросить
+      if (rx_buf_.size() > 256) rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - 2);
+      break;
+    }
+    // отрезать мусор перед заголовком
+    if (it_head != rx_buf_.begin())
+      rx_buf_.erase(rx_buf_.begin(), it_head);
 
+    // искать хвост после головы
+    auto it_tail = std::search(rx_buf_.begin() + 2, rx_buf_.end(), std::begin(TAIL), std::end(TAIL));
+    if (it_tail == rx_buf_.end()) break; // ждём ещё байтов
+
+    std::vector<uint8_t> frame(rx_buf_.begin(), it_tail + 2);
     this->log_hex_dump_("RX frame", frame);
+
     if (frame.size() >= 20) {
       learn_from_status_(frame);
       handle_status_(frame);
@@ -68,9 +81,9 @@ void ACHiClimate::loop() {
     rx_buf_.erase(rx_buf_.begin(), it_tail + 2);
   }
 
-  // опрос
+  // периодический опрос
   uint32_t now = millis();
-  if (now - last_poll_ >= update_interval_ms_) {
+  if (now >= next_poll_not_before_ms_ && (now - last_poll_) >= update_interval_ms_) {
     last_poll_ = now;
     this->send_status_request_short_();
   }
@@ -78,8 +91,10 @@ void ACHiClimate::loop() {
 
 void ACHiClimate::control(const climate::ClimateCall &call) {
   bool need_write = false;
+  bool mode_changed = false;
 
   if (call.get_mode().has_value()) {
+    mode_changed = true;
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
       power_bin_ = 0x00;      // OFF
@@ -110,23 +125,23 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
     need_write = true;
   }
 
-  // (на этом этапе мы сознательно НЕ меняем [16], [32..35] — см. send_write_frame_)
   if (need_write) {
-    expected_mode_byte_     = uint8_t(mode_bin_ + power_bin_);
+    // Если режим НЕ меняли — не трогаем [18]: ждём подтверждение текущего значения из статуса
+    expected_mode_byte_     = mode_changed ? uint8_t(mode_bin_ + power_bin_) : last_mode_power_;
     guard_mode_until_match_ = true;
-    guard_deadline_ms_      = millis() + 6000;   // ждём подтверждение до 6с
+    guard_deadline_ms_      = millis() + 6000;
     suppress_until_ms_      = millis() + 2500;
 
     this->send_write_frame_();
-    // чтобы не сдублировать ближайший периодический опрос, чуть сдвинем
-    last_poll_ = millis() + 500;  // следующий короткий опрос не раньше чем через 0.5с
+
+    // блокируем периодический опрос, пока не придёт наш пост-опрос
+    next_poll_not_before_ms_ = millis() + 450; // чуть больше таймаута 180ms на пост-опрос
   }
 
-  this->publish_state(); // обновить карточку HA
+  this->publish_state();
 }
 
 void ACHiClimate::send_status_request_short_() {
-  // Короткий 0x66 (стандартный)
   static const uint8_t req[] = {
     0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
   };
@@ -135,14 +150,14 @@ void ACHiClimate::send_status_request_short_() {
   ESP_LOGD(TAG, "TX status req (0x66 short)");
 }
 
-// ======= MIRROR-WRITE: меняем ТОЛЬКО [18] и [19] =======
+// ======= MIRROR-WRITE: меняем ТОЛЬКО [18] и/или [19] =======
 void ACHiClimate::send_write_frame_() {
   std::vector<uint8_t> out;
 
   if (!last_status_.empty()) {
     out = last_status_;              // копируем статус целиком (та же длина/поля)
   } else {
-    // экстренно: заготовка (редкий случай старта без статуса)
+    // экстренно: заготовка (редко на самом старте)
     out.assign(50, 0x00);
     out[0] = 0xF4; out[1] = 0xF5;
     for (int i = 0; i < 11; i++) out[2 + i] = header_[i];
@@ -152,15 +167,14 @@ void ACHiClimate::send_write_frame_() {
   const size_t n = out.size();
   if (n < 24) return;
 
-  // строго сохраняем «родные» служебные байты
   out[13] = 0x65;      // команда = запись
   out[14] = fld14_;    // как в статусе
   out[15] = fld15_;    // адрес/канал
-  // [16] не трогаем — как в статусе
-  // МЕНЯЕМ ТОЛЬКО:
-  out[18] = expected_mode_byte_;  // режим+питание (power=0x08 / 0x00)
+  // [16] оставляем как в статусе
+  // МЕНЯЕМ:
+  out[18] = expected_mode_byte_;  // режим+питание
   out[19] = temp_byte_;           // уставка (целые °C)
-  // [23], [32..35] и прочее — НЕ трогаем
+  // [23], [32..35], и всё остальное — не трогаем
 
   // CRC: сумма по [2..n-5] → [n-4]=hi, [n-3]=lo
   int csum = 0;
@@ -199,55 +213,54 @@ void ACHiClimate::learn_from_status_(const std::vector<uint8_t> &bytes) {
 }
 
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
-  if (bytes.size() < 20) return;
-  uint8_t cmd = (bytes.size() > 13) ? bytes[13] : 0x00;
-  if (cmd != 102) { this->last_rx_ms_ = millis(); return; }
+  if (bytes.size() < 21) return; // нам нужны как минимум [20]
+  uint8_t cmd = bytes[13];
+  if (cmd != 0x66) { this->last_rx_ms_ = millis(); return; }
 
   // [19]=Tset (°C), [20]=Tcur (°C)
-  if (bytes.size() > 20) {
-    uint8_t tset = bytes[19];
-    uint8_t tcur = bytes[20];
-    this->target_temperature = tset;
-    this->current_temperature = tcur;
-    if (tset_s_)  tset_s_->publish_state(tset);
-    if (tcur_s_)  tcur_s_->publish_state(tcur);
-  }
+  uint8_t tset = bytes[19];
+  uint8_t tcur = bytes[20];
+  this->target_temperature = tset;
+  this->current_temperature = tcur;
+  if (tset_s_)  tset_s_->publish_state(tset);
+  if (tcur_s_)  tcur_s_->publish_state(tcur);
 
-  // Режим/питание в [18], питание = бит 0x08
+  // Режим/питание в [18], питание = бит 0x08 — и СИНХРОНИЗИРУЕМ «бинарные» поля
+  uint8_t b = bytes[18];
+  last_mode_power_ = b;
+  power_bin_ = (b & 0x08) ? 0x08 : 0x00;
+  mode_bin_  = (b & 0x70); // те же биты, что и в статусе (mode<<4)
+
   bool allow_mode_update = (int32_t)(millis() - suppress_until_ms_) >= 0;
 
-  if (bytes.size() > 18) {
-    uint8_t b = bytes[18];
-
-    if (guard_mode_until_match_) {
-      bool timed_out = (int32_t)(millis() - guard_deadline_ms_) >= 0;
-      if (b == expected_mode_byte_) {
-        guard_mode_until_match_ = false;
-        allow_mode_update = true;
-        ESP_LOGD(TAG, "Guard matched: [18]=%02X", b);
-      } else if (!timed_out) {
-        allow_mode_update = false;
-        ESP_LOGD(TAG, "Guard active: ignore mode/power [18]=%02X, expect %02X", b, expected_mode_byte_);
-      } else {
-        guard_mode_until_match_ = false;
-        ESP_LOGW(TAG, "Guard timeout: accepting [18]=%02X", b);
-      }
+  if (guard_mode_until_match_) {
+    bool timed_out = (int32_t)(millis() - guard_deadline_ms_) >= 0;
+    if (b == expected_mode_byte_) {
+      guard_mode_until_match_ = false;
+      allow_mode_update = true;
+      ESP_LOGD(TAG, "Guard matched: [18]=%02X", b);
+    } else if (!timed_out) {
+      allow_mode_update = false;
+      ESP_LOGD(TAG, "Guard active: ignore mode/power [18]=%02X, expect %02X", b, expected_mode_byte_);
+    } else {
+      guard_mode_until_match_ = false;
+      ESP_LOGW(TAG, "Guard timeout: accepting [18]=%02X", b);
     }
+  }
 
-    if (allow_mode_update) {
-      bool rx_power = (b & 0x08) != 0;
-      if (!rx_power) {
-        this->mode = climate::CLIMATE_MODE_OFF;
-        this->power_ = false;
-      } else {
-        this->power_ = true;
-        uint8_t m = (b >> 4) & 0x07;
-        if (m == 0)      this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-        else if (m == 1) this->mode = climate::CLIMATE_MODE_HEAT;
-        else if (m == 2) this->mode = climate::CLIMATE_MODE_COOL;
-        else if (m == 3) this->mode = climate::CLIMATE_MODE_DRY;
-        else             this->mode = climate::CLIMATE_MODE_AUTO;
-      }
+  if (allow_mode_update) {
+    bool rx_power = (b & 0x08) != 0;
+    if (!rx_power) {
+      this->mode = climate::CLIMATE_MODE_OFF;
+      this->power_ = false;
+    } else {
+      this->power_ = true;
+      uint8_t m = (b >> 4) & 0x07;
+      if (m == 0)      this->mode = climate::CLIMATE_MODE_FAN_ONLY;
+      else if (m == 1) this->mode = climate::CLIMATE_MODE_HEAT;
+      else if (m == 2) this->mode = climate::CLIMATE_MODE_COOL;
+      else if (m == 3) this->mode = climate::CLIMATE_MODE_DRY;
+      else             this->mode = climate::CLIMATE_MODE_AUTO;
     }
   }
 

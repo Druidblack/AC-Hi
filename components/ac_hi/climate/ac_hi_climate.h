@@ -15,7 +15,7 @@ namespace ac_hi {
 /**
  * ACHiClimate — ESPHome climate для Ballu/Hisense RS-485.
  * Кадры: F4 F5 ... F4 FB, статус 0x66, запись 0x65.
- * MIRROR-WRITE: копируем последний 0x66 и изменяем ТОЛЬКО [18] (питание+режим) и [19] (уставка).
+ * MIRROR-WRITE: копируем последний 0x66 и меняем ТОЛЬКО [18] (питание+режим) и/или [19] (уставка).
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
@@ -47,6 +47,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   // ===== runtime =====
   uint32_t update_interval_ms_{2000};
   uint32_t last_poll_{0};
+  uint32_t next_poll_not_before_ms_{0};   // защита от двойного опроса после записи
   uint32_t last_rx_ms_{0};
 
   // анти-откат
@@ -67,15 +68,15 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
 
   // последний валидный статус-кадр (для mirror-write)
   std::vector<uint8_t> last_status_;
+  uint8_t last_mode_power_{0}; // последний принятый [18] из статуса
 
-  // намерение
+  // намерение/текущее состояние (держим в «синхроне» со статусом)
   bool    power_{false};
   float   target_temp_{24};
   uint8_t temp_byte_{24};     // просто °C
-
   // ВАЖНО: power-бит = 0x08 (ON) / 0x00 (OFF)
   uint8_t power_bin_{0};
-  uint8_t mode_bin_{0};       // 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
+  uint8_t mode_bin_{0};       // (mode<<4): 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
 
   // сенсоры (опц.)
   sensor::Sensor *tset_s_{nullptr};
