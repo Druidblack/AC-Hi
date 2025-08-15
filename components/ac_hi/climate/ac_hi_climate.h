@@ -43,9 +43,8 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void apply_intent_to_frame_();
   void compute_crc_(std::vector<uint8_t> &buf);
   void send_status_request_short_();       // короткий статус (0x66)
-  void send_status_request_long_clean_();  // длинный «чистый» 0x66
   void send_write_frame_();                // запись 0x65 + пост-опрос
-  void learn_header_(const std::vector<uint8_t> &bytes);
+  void learn_header_from_status_(const std::vector<uint8_t> &bytes);
   void handle_status_(const std::vector<uint8_t> &bytes);
   void log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data);
 
@@ -53,7 +52,6 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   uint32_t update_interval_ms_{2000};
   uint32_t last_poll_{0};
   uint32_t last_rx_ms_{0};
-  uint32_t last_long_status_ms_{0};
 
   // анти-откат (простое окно)
   uint32_t suppress_until_ms_{0};
@@ -76,12 +74,12 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   // текущее намерение/состояние
   bool   power_{false};
   float  target_temp_{24};
-  uint8_t temp_byte_{(24U << 1) | 1};
-  uint8_t wind_code_{1}; // status: auto=1, low~12, med~14, high~16
+  uint8_t temp_byte_{24};     // ТЕПЕРЬ это просто °C (как в статусе)
+  uint8_t wind_code_{1};      // status: auto=1, low~12, med~14, high~16
   bool swing_ud_{false};
   bool swing_lr_{false};
-  uint8_t power_bin_{0}; // 0b00001100=ON, 0b00000100=OFF
-  uint8_t mode_bin_{0};  // старшая тетрада: 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
+  uint8_t power_bin_{0};      // 0b00001100=ON, 0b00000100=OFF
+  uint8_t mode_bin_{0};       // старшая тетрада: 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
   uint8_t turbo_bin_{0};
   uint8_t eco_bin_{0};
   uint8_t quiet_bin_{0};
