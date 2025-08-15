@@ -13,13 +13,13 @@ void ACHiClimate::setup() {
   ESP_LOGI(TAG, "Init climate over RS-485");
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 
-  // Базовая уставка, чтобы ползунок температуры был доступен сразу
+  // Стартовая уставка для доступности ползунка до первого статуса
   this->target_temperature = 24.0f;
 
-  // Сформируем базовый длинный кадр (тип 0x29)
+  // Базовая заготовка длинного кадра (для записи)
   this->build_base_long_frame_();
 
-  // Первый опрос статуса (длинный, «чистый»)
+  // Первый опрос статуса (короткий, «тихий»)
   this->set_timeout("init_status", 500, [this]() { this->send_status_request_(); });
 }
 
@@ -66,17 +66,11 @@ void ACHiClimate::loop() {
   // Parse frames
   while (this->parse_next_frame_()) {}
 
-  // Периодический опрос статуса (длинный, «чистый», без звука)
+  // Периодический опрос статуса (короткий)
   const uint32_t now = millis();
   if (now - this->last_poll_ >= this->update_interval_ms_) {
     this->last_poll_ = now;
     this->send_status_request_();
-  }
-
-  // если давно не получали RX — чуть ускорим следующий опрос
-  if (now - this->last_rx_ms_ > 10000 && now - this->last_poll_ > 1200) {
-    this->send_status_request_();
-    this->last_poll_ = now;
   }
 }
 
@@ -96,7 +90,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
       this->mode = m;
       this->power_ = true;
 
-      // индексы: 0=FAN_ONLY,1=HEAT,2=COOL,3=DRY,4=AUTO → в байте статуса видим нечётные nibble
+      // индексы: 0=FAN_ONLY,1=HEAT,2=COOL,3=DRY,4=AUTO → odd-nibble при записи
       uint8_t idx = 4; // auto
       if (m == climate::CLIMATE_MODE_HEAT) idx = 1;
       else if (m == climate::CLIMATE_MODE_COOL) idx = 2;
@@ -113,7 +107,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
     float t = *call.get_target_temperature();
     if (t < 16.0f) t = 16.0f;
     if (t > 30.0f) t = 30.0f;
-    this->target_temperature = t;             // чтобы HA сразу показывал значение
+    this->target_temperature = t;
     this->target_temp_ = t;
     temp_byte_ = (uint8_t(t) << 1) | 0x01;
     need_write = true;
@@ -146,14 +140,17 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 // ======================= Protocol I/O =======================
 
 void ACHiClimate::build_base_long_frame_() {
-  // Длинный “базовый” пакет 50 байт (тип 0x29)
+  // Длинный “базовый” пакет 50 байт (тип 0x29) — по рабочему yaml
   out_.assign(50, 0x00);
   out_[0]  = 0xF4; out_[1]  = 0xF5;
-
-  // заголовок [2..12] — из обученного, либо дефолтного массива
-  for (int i = 0; i < 11; i++) out_[2 + i] = header_[i];
-
-  // [13] — команда (0x65 write / 0x66 status)
+  out_[2]  = 0x00; out_[3]  = 0x40;
+  out_[4]  = 0x29;
+  out_[5]  = 0x00; out_[6]  = 0x00; out_[7]  = 0x01;
+  out_[8]  = 0x01; out_[9]  = 0xFE; out_[10] = 0x01;
+  out_[11] = 0x00; out_[12] = 0x00;
+  // [13] — команда (0x65 write), ставится при отправке
+  // [23] — в рабочем yaml был 0x04, оставим как в yaml для совместимости
+  out_[23] = 0x04;
   out_[48] = 0xF4; out_[49] = 0xFB;
 }
 
@@ -161,7 +158,7 @@ void ACHiClimate::apply_intent_to_frame_() {
   // [16] скорость вентилятора (для записи требуется +1 к статусному коду)
   out_[16] = uint8_t(wind_code_ + 1);
 
-  // [18] составной байт: питание + режим (odd nibble схема)
+  // [18] составной байт: питание + режим (odd-nibble схема)
   out_[18] = uint8_t(power_bin_ + mode_bin_);
   if ((power_bin_ & 0b00001000) == 0) {
     out_[18] = uint8_t(out_[18] & (~(1U<<3)));
@@ -174,21 +171,23 @@ void ACHiClimate::apply_intent_to_frame_() {
   uint8_t updown    = swing_ud_ ? 0b00110000 : 0b00010000;
   uint8_t leftright = swing_lr_ ? 0b00001100 : 0b00000100;
   out_[32] = uint8_t(updown + leftright);
+
+  // [33] turbo + eco (держим off по умолчанию)
+  out_[33] = uint8_t(turbo_bin_ + eco_bin_);
+
+  // [35] quiet (держим off)
+  out_[35] = quiet_bin_;
 }
 
 void ACHiClimate::send_status_request_() {
-  // ДЛИННЫЙ запрос статуса (0x29 + cmd 0x66), «чистый»: без проставления полей управления
-  // ВАЖНО: используем обученный заголовок (иначе некоторые юниты не отвечают).
-  this->build_base_long_frame_();
-  out_[13] = 0x66;
-
-  // Не трогаем [16],[18],[19],[32] — оставляем 0x00
-  this->compute_crc_(out_);
-
-  this->write_array(out_.data(), out_.size());
+  // КОРОТКИЙ запрос статуса (cmd 0x66) — бесшумный и стабильный
+  // F4 F5 00 40 0C 00 00 01 01 FE 01 00 00 66 00 00 00 01 B3 F4 FB
+  const uint8_t req[] = {
+    0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
+  };
+  this->write_array(req, sizeof(req));
   this->flush();
-  ESP_LOGVV(TAG, "TX status req (0x66 long, clean) with hdr: %02X %02X %02X ...",
-            out_[2], out_[3], out_[4]);
+  ESP_LOGVV(TAG, "TX status req (0x66 short)");
 }
 
 void ACHiClimate::send_write_frame_() {
@@ -210,8 +209,8 @@ void ACHiClimate::send_write_frame_() {
   }
   ESP_LOGD(TAG, "TX write(0x65):\n%s", dump.c_str());
 
-  // После записи ожидаем ACK → выучим заголовок → запросим статус
-  this->set_timeout("post_write_status", 220, [this]() { this->send_status_request_(); });
+  // После записи запросим статус (короткий) — без звука
+  this->set_timeout("post_write_status", 180, [this]() { this->send_status_request_(); });
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
@@ -245,10 +244,6 @@ bool ACHiClimate::parse_next_frame_() {
         while (rb_pop_(b)) {
           frame.push_back(b);
           if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
-            // обучимся заголовку с ЛЮБОГО кадра
-            learn_header_(frame);
-
-            // обработка статуса
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
@@ -265,19 +260,6 @@ bool ACHiClimate::parse_next_frame_() {
   return false;
 }
 
-void ACHiClimate::learn_header_(const std::vector<uint8_t> &bytes) {
-  if (bytes.size() <= 12) return;
-  // запомним [2..12]
-  for (int i = 0; i < 11; i++) header_[i] = bytes[2 + i];
-  if (!header_learned_) {
-    header_learned_ = true;
-    ESP_LOGI(TAG, "Learned header: %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X",
-             header_[0],header_[1],header_[2],header_[3],header_[4],
-             header_[5],header_[6],header_[7],header_[8],header_[9],header_[10]);
-  }
-  this->last_rx_ms_ = millis();
-}
-
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 20) return;
 
@@ -285,7 +267,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   uint8_t cmd = (bytes.size() > 13) ? bytes[13] : 0x00;
 
   if (cmd == 101) {
-    // ACK после записи — ничего не публикуем, но заголовок уже выучен в learn_header_()
+    // ACK после записи — не публикуем, ждём следующий 102
     ESP_LOGV(TAG, "RX ACK (101), len=%u", (unsigned)bytes.size());
     return;
   }
@@ -301,9 +283,9 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->power_ = new_power;
   }
 
-  // Mode: старший полубайт [18] — НЕЧЁТНЫЕ значения!
+  // Mode: старший полубайт [18] — odd-nibble (1,3,5,7,9)
   if (bytes.size() > 18) {
-    uint8_t nibble = (bytes[18] >> 4) & 0x0F;  // ожидаем 1,3,5,7,9
+    uint8_t nibble = (bytes[18] >> 4) & 0x0F;
     climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
     switch (nibble) {
       case 1: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
@@ -327,13 +309,10 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->fan_mode = new_fan;
   }
 
-  // Температуры — типичный вариант: [19] уставка, [20] текущая (в °C).
-  // Если получим явный мусор, не затираем разумные значения.
+  // Температуры — [19] уставка, [20] текущая (в °C)
   if (bytes.size() > 20) {
-    uint8_t tset = bytes[19];
-    uint8_t tcur = bytes[20];
-    if (tset >= 8 && tset <= 45) this->target_temperature  = float(tset);
-    if (tcur >= 8 && tcur <= 45) this->current_temperature = float(tcur);
+    this->target_temperature  = float(bytes[19]);
+    this->current_temperature = float(bytes[20]);
   }
 
   // Качание — биты в [35]: bit7 UD, bit6 LR (если поле присутствует)
@@ -348,7 +327,6 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
            this->current_temperature, this->target_temperature);
 
   this->publish_state();
-  this->last_rx_ms_ = millis();
 }
 
 }  // namespace ac_hi
