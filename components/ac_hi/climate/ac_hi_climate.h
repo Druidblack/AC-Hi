@@ -13,7 +13,8 @@ namespace ac_hi {
 
 /**
  * ACHiClimate — нативный ESPHome climate для кондиционеров Ballu/Hisense по RS-485.
- * Чтение статуса — коротким кадром (cmd 0x66), запись — длинным кадром 0x29 (cmd 0x65).
+ * Чтение статуса — коротким кадром (cmd 0x66). Если 10+ секунд нет RX, раз в 30с шлём
+ * «длинный чистый» 0x29/0x66 как fallback. Запись — 0x29/0x65.
  * CRC: 16-битная сумма по [2..len-5] → [len-4],[len-3], затем хвост 0xF4 0xFB.
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
@@ -29,13 +30,18 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void control(const climate::ClimateCall &call) override;
 
   // ===== I/O helpers =====
-  void send_status_request_();          // короткий статус (0x66)
-  void send_write_frame_();             // запись (0x29 + 0x65)
-  void build_base_long_frame_();        // заполнить out_ базовым шаблоном (50 байт)
-  void apply_intent_to_frame_();        // проставить power/mode/temp/fan/swing в out_
+  void send_status_request_();              // короткий статус (0x66)
+  void send_status_request_long_clean_();   // длинный «чистый» статус (0x29/0x66) — редкий fallback
+  void send_write_frame_();                 // запись (0x29/0x65)
+
+  void build_base_long_frame_();            // заполнить out_ базовым шаблоном (50 байт)
+  void apply_intent_to_frame_();            // проставить power/mode/temp/fan/swing в out_
   void compute_crc_(std::vector<uint8_t> &buf);
   bool parse_next_frame_();
   void handle_status_(const std::vector<uint8_t> &bytes);
+
+  // logging helpers
+  void log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data);
 
   // ===== Состояние =====
   bool power_{false};
@@ -62,12 +68,14 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   std::vector<uint8_t> out_{50, 0x00};
 
   // RX ring buffer
-  static constexpr size_t RB_SIZE = 768;
+  static constexpr size_t RB_SIZE = 1024;
   uint8_t rb_[RB_SIZE]{};
   size_t rb_head_{0}, rb_tail_{0};
 
   // timing
   uint32_t last_poll_{0};
+  uint32_t last_rx_ms_{0};
+  uint32_t last_long_status_ms_{0};
   uint32_t update_interval_ms_{2000};
 
   // helpers

@@ -16,7 +16,7 @@ void ACHiClimate::setup() {
   // Стартовая уставка для доступности ползунка до первого статуса
   this->target_temperature = 24.0f;
 
-  // Базовая заготовка длинного кадра (для записи)
+  // Базовая заготовка длинного кадра (для записи и длинного статуса)
   this->build_base_long_frame_();
 
   // Первый опрос статуса (короткий, «тихий»)
@@ -66,11 +66,18 @@ void ACHiClimate::loop() {
   // Parse frames
   while (this->parse_next_frame_()) {}
 
-  // Периодический опрос статуса (короткий)
   const uint32_t now = millis();
+
+  // Периодический короткий опрос
   if (now - this->last_poll_ >= this->update_interval_ms_) {
     this->last_poll_ = now;
     this->send_status_request_();
+  }
+
+  // Если давно не слышим ответов — редкий длинный «чистый» опрос (без пищалки-спама)
+  if ((now - this->last_rx_ms_ > 10000) && (now - this->last_long_status_ms_ > 30000)) {
+    this->last_long_status_ms_ = now;
+    this->send_status_request_long_clean_();
   }
 }
 
@@ -148,8 +155,8 @@ void ACHiClimate::build_base_long_frame_() {
   out_[5]  = 0x00; out_[6]  = 0x00; out_[7]  = 0x01;
   out_[8]  = 0x01; out_[9]  = 0xFE; out_[10] = 0x01;
   out_[11] = 0x00; out_[12] = 0x00;
-  // [13] — команда (0x65 write), ставится при отправке
-  // [23] — в рабочем yaml был 0x04, оставим как в yaml для совместимости
+  // [13] — команда (0x65 write / 0x66 status)
+  // [23] — в рабочем yaml был 0x04 (оставляем)
   out_[23] = 0x04;
   out_[48] = 0xF4; out_[49] = 0xFB;
 }
@@ -187,7 +194,18 @@ void ACHiClimate::send_status_request_() {
   };
   this->write_array(req, sizeof(req));
   this->flush();
-  ESP_LOGVV(TAG, "TX status req (0x66 short)");
+  ESP_LOGD(TAG, "TX status req (0x66 short)");
+}
+
+void ACHiClimate::send_status_request_long_clean_() {
+  // ДЛИННЫЙ «чистый» запрос статуса 0x29/0x66 — без заполнения управляющих полей
+  this->build_base_long_frame_();
+  out_[13] = 0x66;
+  // [16],[18],[19],[32] оставляем по нулям, только CRC/хвост
+  this->compute_crc_(out_);
+  this->write_array(out_.data(), out_.size());
+  this->flush();
+  ESP_LOGD(TAG, "TX status req (0x66 long, clean)");
 }
 
 void ACHiClimate::send_write_frame_() {
@@ -200,14 +218,7 @@ void ACHiClimate::send_write_frame_() {
   this->flush();
 
   // Дамп для диагностики
-  std::string dump;
-  for (size_t i = 0; i < out_.size(); i++) {
-    char b[4];
-    snprintf(b, sizeof(b), "%02X ", out_[i]);
-    dump += b;
-    if ((i + 1) % 16 == 0) dump += "\n";
-  }
-  ESP_LOGD(TAG, "TX write(0x65):\n%s", dump.c_str());
+  this->log_hex_dump_("TX write(0x65)", out_);
 
   // После записи запросим статус (короткий) — без звука
   this->set_timeout("post_write_status", 180, [this]() { this->send_status_request_(); });
@@ -244,10 +255,14 @@ bool ACHiClimate::parse_next_frame_() {
         while (rb_pop_(b)) {
           frame.push_back(b);
           if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
+            // ЛОГ RX
+            this->log_hex_dump_("RX frame", frame);
+
+            // обработка статуса
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
-          if (++guard > 1024) break; // защита от бесконечного потока без хвоста
+          if (++guard > 2048) break; // защита от бесконечного потока без хвоста
         }
         return false;
       } else {
@@ -265,15 +280,15 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
 
   // Команда (ACK=101, STATUS=102)
   uint8_t cmd = (bytes.size() > 13) ? bytes[13] : 0x00;
+  ESP_LOGD(TAG, "RX summary: cmd=%u len=%u", cmd, (unsigned)bytes.size());
 
   if (cmd == 101) {
-    // ACK после записи — не публикуем, ждём следующий 102
-    ESP_LOGV(TAG, "RX ACK (101), len=%u", (unsigned)bytes.size());
+    // ACK после записи — не публикуем, просто отметим активность
+    this->last_rx_ms_ = millis();
     return;
   }
   if (cmd != 102) {
     // неизвестный тип — пропустим
-    ESP_LOGVV(TAG, "RX non-status cmd=%u, len=%u", cmd, (unsigned)bytes.size());
     return;
   }
 
@@ -293,7 +308,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
       case 5: new_mode = climate::CLIMATE_MODE_COOL;     break;
       case 7: new_mode = climate::CLIMATE_MODE_DRY;      break;
       case 9: new_mode = climate::CLIMATE_MODE_AUTO;     break;
-      default: /* оставить прежний */ break;
+      default: /* no change */ break;
     }
     this->mode = this->power_ ? new_mode : climate::CLIMATE_MODE_OFF;
   }
@@ -309,10 +324,12 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->fan_mode = new_fan;
   }
 
-  // Температуры — [19] уставка, [20] текущая (в °C)
+  // Температуры — [19] уставка, [20] текущая (в °C). Защита от явного мусора.
   if (bytes.size() > 20) {
-    this->target_temperature  = float(bytes[19]);
-    this->current_temperature = float(bytes[20]);
+    uint8_t tset = bytes[19];
+    uint8_t tcur = bytes[20];
+    if (tset >= 8 && tset <= 45) this->target_temperature  = float(tset);
+    if (tcur >= 8 && tcur <= 45) this->current_temperature = float(tcur);
   }
 
   // Качание — биты в [35]: bit7 UD, bit6 LR (если поле присутствует)
@@ -322,11 +339,22 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
   }
 
-  ESP_LOGV(TAG, "RX status: power=%d mode=%d fan=%d t=%.1f/%.1f",
-           int(this->power_), int(this->mode), int(this->fan_mode),
-           this->current_temperature, this->target_temperature);
-
   this->publish_state();
+  this->last_rx_ms_ = millis();
+}
+
+// ======================= Logging helpers =======================
+
+void ACHiClimate::log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data) {
+  std::string dump;
+  dump.reserve(data.size() * 3 + data.size() / 16 + 16);
+  for (size_t i = 0; i < data.size(); i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02X ", data[i]);
+    dump += b;
+    if ((i + 1) % 16 == 0) dump += "\n";
+  }
+  ESP_LOGD(TAG, "%s:\n%s", prefix, dump.c_str());
 }
 
 }  // namespace ac_hi
