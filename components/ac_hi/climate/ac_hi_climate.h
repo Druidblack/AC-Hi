@@ -53,7 +53,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   bool swing_ud_{false};
   bool swing_lr_{false};
 
-  // write-intent (как в рабочем legacy yaml)
+  // write-intent (по рабочему legacy yaml)
   uint8_t power_bin_{0x04};                 // база 0x04; ON добавляет bit3
   uint8_t mode_bin_{0x10};                  // ((idx<<1)|1)<<4  — odd-nibble схема
   uint8_t wind_code_{0x01};                 // 1=auto; 12/14/16=low/med/high

@@ -58,11 +58,20 @@ climate::ClimateTraits ACHiClimate::traits() {
 // ======================= Loop =======================
 
 void ACHiClimate::loop() {
-  // RX collect
+  // RX collect — накопим сырую порцию, сразу залогируем (чтобы понять, молчит ли линия вообще)
+  std::vector<uint8_t> raw_rx;
+  raw_rx.reserve(256);
+
   while (this->available()) {
     uint8_t b = this->read();
+    raw_rx.push_back(b);
     this->rb_push_(b);
   }
+
+  if (!raw_rx.empty()) {
+    this->log_hex_dump_("RX raw", raw_rx);
+  }
+
   // Parse frames
   while (this->parse_next_frame_()) {}
 
@@ -246,6 +255,7 @@ bool ACHiClimate::parse_next_frame_() {
   while (rb_pop_(b)) {
     if (b == 0xF4) {
       uint8_t b2;
+      // если второго байта ещё нет — вернём F4 в буфер и ждём
       if (!rb_pop_(b2)) { rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE; return false; }
       if (b2 == 0xF5) {
         std::vector<uint8_t> frame;
@@ -255,18 +265,19 @@ bool ACHiClimate::parse_next_frame_() {
         while (rb_pop_(b)) {
           frame.push_back(b);
           if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
-            // ЛОГ RX
+            // ЛОГ RX — дамп всего кадра
             this->log_hex_dump_("RX frame", frame);
 
             // обработка статуса
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
-          if (++guard > 2048) break; // защита от бесконечного потока без хвоста
+          if (++guard > 2048) break; // защита от бесконечной «каши»
         }
+        // если мы тут — хвост не увидели, прерываем
         return false;
       } else {
-        // откат b2 назад
+        // откат b2 назад (мы его читали зря), F4 уже «съели», но это был не кадр
         rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE;
       }
     }
@@ -289,6 +300,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   }
   if (cmd != 102) {
     // неизвестный тип — пропустим
+    this->last_rx_ms_ = millis();
     return;
   }
 
