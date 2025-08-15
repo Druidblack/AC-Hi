@@ -16,10 +16,10 @@ void ACHiClimate::setup() {
   // Базовая уставка, чтобы ползунок температуры был доступен сразу
   this->target_temperature = 24.0f;
 
-  // Сформируем базовый длинный кадр (тип 0x29) — используется только для записи
+  // Сформируем базовый длинный кадр (тип 0x29) — используется для записи и для опроса статуса
   this->build_base_long_frame_();
 
-  // Первый опрос статуса
+  // Первый опрос статуса (длинный, «чистый»)
   this->set_timeout("init_status", 500, [this]() { this->send_status_request_(); });
 }
 
@@ -66,7 +66,7 @@ void ACHiClimate::loop() {
   // Parse frames
   while (this->parse_next_frame_()) {}
 
-  // Periodic status request (короткий, бесшумный)
+  // Периодический опрос статуса (длинный, «чистый», без звука)
   const uint32_t now = millis();
   if (now - this->last_poll_ >= this->update_interval_ms_) {
     this->last_poll_ = now;
@@ -140,7 +140,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 // ======================= Protocol I/O =======================
 
 void ACHiClimate::build_base_long_frame_() {
-  // Длинный “базовый” пакет 50 байт (тип 0x29) — по примерам Hisense/AirCon
+  // Длинный “базовый” пакет 50 байт (тип 0x29)
   out_.assign(50, 0x00);
   out_[0]  = 0xF4; out_[1]  = 0xF5;
   out_[2]  = 0x00; out_[3]  = 0x40;
@@ -148,7 +148,7 @@ void ACHiClimate::build_base_long_frame_() {
   out_[5]  = 0x00; out_[6]  = 0x00; out_[7]  = 0x01;
   out_[8]  = 0x01; out_[9]  = 0xFE; out_[10] = 0x01;
   out_[11] = 0x00; out_[12] = 0x00;
-  // [13] — команда (0x65 write), выставляется в send_write_frame_()
+  // [13] — команда (0x65 write / 0x66 status)
   out_[48] = 0xF4; out_[49] = 0xFB;
 }
 
@@ -172,14 +172,17 @@ void ACHiClimate::apply_intent_to_frame_() {
 }
 
 void ACHiClimate::send_status_request_() {
-  // КОРОТКИЙ запрос статуса (cmd 0x66) — бесшумный, подтверждён сообществом
-  // F4 F5 00 40 0C 00 00 01 01 FE 01 00 00 66 00 00 00 01 B3 F4 FB
-  const uint8_t req[] = {
-    0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
-  };
-  this->write_array(req, sizeof(req));
+  // ДЛИННЫЙ запрос статуса (0x29 + cmd 0x66), «чистый»: без проставления полей управления
+  // Это не триггерит звуковую индикацию и возвращает полный статус блока (см. тред по ESPHome/Hisense). :contentReference[oaicite:1]{index=1}
+  this->build_base_long_frame_();
+  out_[13] = 0x66;
+
+  // Важно: не трогаем [16],[18],[19],[32] — оставляем 0x00
+  this->compute_crc_(out_);
+
+  this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGVV(TAG, "TX status req (0x66 short)");
+  ESP_LOGVV(TAG, "TX status req (0x66 long, clean)");
 }
 
 void ACHiClimate::send_write_frame_() {
@@ -201,8 +204,8 @@ void ACHiClimate::send_write_frame_() {
   }
   ESP_LOGD(TAG, "TX write(0x65):\n%s", dump.c_str());
 
-  // После записи запросим статус (короткий) — без звука
-  this->set_timeout("post_write_status", 150, [this]() { this->send_status_request_(); });
+  // После записи запросим статус (длинный «чистый») — без звука
+  this->set_timeout("post_write_status", 200, [this]() { this->send_status_request_(); });
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
@@ -254,7 +257,7 @@ bool ACHiClimate::parse_next_frame_() {
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 20) return;
 
-  // Интересен cmd=0x66 (102). Ответ может быть “длинным” (≈50 байт) или покороче.
+  // Интересен cmd=0x66 (102). Ответ обычно длинный 0x29, cmd=0x66.
   if (bytes.size() > 13 && bytes[13] != 102) {
     // 101 — ack после записи; игнор для состояния
     return;
