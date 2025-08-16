@@ -11,28 +11,25 @@
 #endif
 
 #include <vector>
+#include <cstddef>
 
-// Форвард-декларация класса Sensor на случай, если USE_SENSOR не определён
 namespace esphome {
 namespace sensor {
-class Sensor;
+class Sensor;  // форвард, если USE_SENSOR не определён
 }  // namespace sensor
 }  // namespace esphome
 
 namespace esphome {
 namespace ac_hi {
 
-// Encodings from hisense.yaml
-// Byte map (0-based):
-// 16 - fan speed
-// 17 - sleep
-// 18 - mode (hi nibble) + power/toggle bits (lo nibble)
-// 19 - target temp encoded (2*T + 1)
-// 32 - swing: up-down (bits 7:6), left-right (bits 5:4)
-// 33 - turbo/eco (writer), фактические флаги в статусе читаем с 35/36
-// 35 - quiet (bits 5:4), + флаги swing read
-// 36 - LED (bits 7:6) и quiet-флаг при чтении
-// 20 - current temp, 21 - pipe temp (read-only)
+// Кадры Hisense: потоковая передача, маркеры начала/конца кадра такие же, как в YAML
+// Header: 0xF4 0xF5
+// Tail  : 0xF4 0xFB
+// Внутри есть поле "длина" (байт [4]) и 2-байтный CRC (сумма с 2 по n-4)
+static constexpr uint8_t HI_HDR0 = 0xF4;
+static constexpr uint8_t HI_HDR1 = 0xF5;
+static constexpr uint8_t HI_TAIL0 = 0xF4;
+static constexpr uint8_t HI_TAIL1 = 0xFB;
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -53,33 +50,41 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // UART: метод set_uart_parent(...) унаследован из uart::UARTDevice
 
  protected:
-  // Protocol helpers
-  void send_query_status_();    // short request (cmd 0x66)
-  void send_write_changes_();   // full packet with CRC
+  // ---- Протокол/транспорт ----
+  void send_query_status_();    // короткий запрос состояния (cmd 0x66)
+  void send_write_changes_();   // полная посылка состояния с CRC
   void calc_and_patch_crc_(std::vector<uint8_t> &buf);
+  bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
+
+  // RX фреймер/парсер
+  void try_parse_frames_from_buffer_();                    // сканер потока
+  bool extract_next_frame_(std::vector<uint8_t> &frame);   // достаёт [F4 F5 ... F4 FB]
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
-  // Buffering
+  // Логирование/дампы
+  void log_hex_frame_(const char *dir, const std::vector<uint8_t> &data, const char *note = nullptr) const;
+
+  // Буфер входящего потока
   std::vector<uint8_t> rx_;
   bool writing_lock_{false};
   bool pending_write_{false};
   uint32_t last_rx_ms_{0};
 
-  // Cached "bytearray" to be sent (из YAML initial vector)
+  // Базовый кадр записи (как в YAML initial vector)
   std::vector<uint8_t> tx_bytes_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,
       0x65, 0x00, 0x00, 0x00, // 0..16
-      0x00, // [17]
+      0x00, // [17] sleep
       0x00, // [18] power+mode
-      0x00, // [19] temp
-      0x00, // [20] cur temp (filled by AC)
-      0x00, // [21] pipe temp
+      0x00, // [19] set temp (2*T+1)
+      0x00, // [20] current temp (RO)
+      0x00, // [21] pipe temp (RO)
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
       0x00, 0x00, // 30..31
       0x00, // [32] swing UD/LR
-      0x00, // [33] turbo/eco
+      0x00, // [33] turbo/eco (tx)
       0x00, // [34]
       0x00, // [35] quiet
       0x00, // [36] LED + misc
@@ -87,16 +92,18 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x00, // [38]
       0x00, 0x00, 0x00, 0x00, 0x00, // 39..43
       0x00, 0x00, // 44..45
-      0x00, 0x00, // 46..47 CRC
-      0xF4, 0xFB    // tail
+      0x00, 0x00, // 46..47 CRC (будут пропатчены)
+      0xF4, 0xFB   // tail
   };
 
-  // Command bytes for query (cmd 0x66)
-  const std::vector<uint8_t> query_ = {0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01, 0x01,
-                                       0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x01,
-                                       0xB3, 0xF4, 0xFB};
+  // Короткий запрос статуса (cmd 0x66) — CRC уже «правильный» для этого шаблона
+  const std::vector<uint8_t> query_ = {
+      0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01, 0x01,
+      0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x01,
+      0xB3, 0xF4, 0xFB
+  };
 
-  // State mirrors
+  // ---- Отражение состояния ----
   bool power_on_{false};
   uint8_t target_c_{24}; // 18..28
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
@@ -108,10 +115,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool led_{true};
   uint8_t sleep_stage_{0}; // 0..4
 
-  // CRC cache
+  // Для подавления повторов статуса
   uint16_t last_status_crc_{0};
 
-  // Helpers mapping
+  // ---- Кодирование полей ----
   uint8_t encode_temp_(uint8_t c) { return static_cast<uint8_t>((c << 1) | 0x01); }
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
   uint8_t encode_fan_byte_(climate::ClimateFanMode f);
@@ -119,10 +126,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_swing_ud_(bool on);
   uint8_t encode_swing_lr_(bool on);
 
-  // Sensors (указатель может быть нулевым)
+  // Сенсор трубки (опционально)
   sensor::Sensor *pipe_sensor_{nullptr};
 
-  // Flags
+  // Флаги
   bool enable_presets_{true};
 };
 
