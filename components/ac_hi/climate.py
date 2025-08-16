@@ -9,7 +9,8 @@ from esphome.const import (
     CONF_UPDATE_INTERVAL,
 )
 
-AUTO_LOAD = ["climate", "uart"]
+# Автоподгрузка зависимостей, чтобы в билде были заголовки и макросы нужных платформ
+AUTO_LOAD = ["climate", "uart", "sensor"]
 
 ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 ACHIClimate = ac_hi_ns.class_("ACHIClimate", climate.Climate, cg.PollingComponent, uart.UARTDevice)

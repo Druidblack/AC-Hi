@@ -4,9 +4,20 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
-#include "esphome/components/sensor/sensor.h"
+
+// Подключаем заголовок сенсоров только если платформа sensor реально присутствует в билде
+#ifdef USE_SENSOR
+  #include "esphome/components/sensor/sensor.h"
+#endif
 
 #include <vector>
+
+// Форвард-декларация класса Sensor на случай, если USE_SENSOR не определён
+namespace esphome {
+namespace sensor {
+class Sensor;
+}  // namespace sensor
+}  // namespace esphome
 
 namespace esphome {
 namespace ac_hi {
@@ -109,7 +120,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_swing_ud_(bool on);
   uint8_t encode_swing_lr_(bool on);
 
-  // Sensors
+  // Sensors (указатель может быть нулевым)
   sensor::Sensor *pipe_sensor_{nullptr};
 
   // Flags

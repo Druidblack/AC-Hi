@@ -319,7 +319,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   this->current_temperature = tair;
 
   // Pipe temp (байт 21)
+#ifdef USE_SENSOR
   if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(bytes[21]);
+#endif
 
   // Turbo/Eco/Quiet/LED по YAML
   uint8_t b35 = bytes[35];
