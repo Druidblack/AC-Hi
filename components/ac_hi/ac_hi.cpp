@@ -6,33 +6,29 @@ namespace esphome {
 namespace ac_hi {
 
 // ---- Локальные хелперы для (де)кодирования режима ----
-// У конкретных плат Hisense встречается раскладка nibble режима (byte[18] >> 4):
-// 0x01=HEAT, 0x03=COOL, 0x05=DRY, 0x07=FAN_ONLY, 0x09=AUTO.
-// Эта таблица согласует индикации HA и самого блока.
+// Целевая раскладка nibble (byte[18] >> 4):
+// 0x00 = FAN_ONLY, 0x01 = HEAT, 0x02 = COOL, 0x03 = DRY.
+// Иного здесь нет — AUTO не поддерживается и в HA не объявляется.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
+    case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
     case 0x01: return climate::CLIMATE_MODE_HEAT;
-    case 0x03: return climate::CLIMATE_MODE_COOL;
-    case 0x05: return climate::CLIMATE_MODE_DRY;
-    case 0x07: return climate::CLIMATE_MODE_FAN_ONLY;
-    case 0x09: return climate::CLIMATE_MODE_AUTO;
-    default:   return climate::CLIMATE_MODE_AUTO;  // fallback
+    case 0x02: return climate::CLIMATE_MODE_COOL;
+    case 0x03: return climate::CLIMATE_MODE_DRY;
+    default:   return climate::CLIMATE_MODE_COOL;  // fallback
   }
 }
-// Обратное соответствие (для формирования TX): хотим получить nibble из набора {1,3,5,7,9}
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   switch (m) {
+    case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
     case climate::CLIMATE_MODE_HEAT:     return 0x01;
-    case climate::CLIMATE_MODE_COOL:     return 0x03;
-    case climate::CLIMATE_MODE_DRY:      return 0x05;
-    case climate::CLIMATE_MODE_FAN_ONLY: return 0x07;
-    case climate::CLIMATE_MODE_AUTO:
-    default:                             return 0x09;
+    case climate::CLIMATE_MODE_COOL:     return 0x02;
+    case climate::CLIMATE_MODE_DRY:      return 0x03;
+    default:                             return 0x02; // AUTO нет, используем COOL
   }
 }
 
 void ACHIClimate::setup() {
-  // Без лишнего логирования
   this->mode = climate::CLIMATE_MODE_OFF;
   this->target_temperature = 24;
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
@@ -79,18 +75,25 @@ void ACHIClimate::loop() {
 climate::ClimateTraits ACHIClimate::traits() {
   climate::ClimateTraits t{};
   t.set_supports_action(false);
-  t.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL, climate::CLIMATE_MODE_HEAT,
-                         climate::CLIMATE_MODE_DRY, climate::CLIMATE_MODE_FAN_ONLY, climate::CLIMATE_MODE_AUTO});
-  t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW, climate::CLIMATE_FAN_MEDIUM,
-                             climate::CLIMATE_FAN_HIGH, climate::CLIMATE_FAN_QUIET});
+  // Без AUTO
+  t.set_supported_modes({
+    climate::CLIMATE_MODE_OFF,
+    climate::CLIMATE_MODE_COOL,
+    climate::CLIMATE_MODE_HEAT,
+    climate::CLIMATE_MODE_DRY,
+    climate::CLIMATE_MODE_FAN_ONLY
+  });
+  t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
+                             climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
+                             climate::CLIMATE_FAN_QUIET});
   t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
                                climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
   if (enable_presets_) {
-    t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO, climate::CLIMATE_PRESET_BOOST,
-                             climate::CLIMATE_PRESET_SLEEP});
+    t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
+                             climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
   }
-  t.set_visual_min_temperature(18);
-  t.set_visual_max_temperature(28);
+  t.set_visual_min_temperature(16);
+  t.set_visual_max_temperature(32);
   t.set_visual_temperature_step(1.0f);
   t.set_supports_current_temperature(true);
   return t;
@@ -114,7 +117,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto t = *call.get_target_temperature();
     if (!std::isnan(t)) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
-      c = std::max<uint8_t>(18, std::min<uint8_t>(28, c));
+      c = std::max<uint8_t>(16, std::min<uint8_t>(32, c));
       this->target_c_ = c;
       need_write = true;
     }
@@ -141,11 +144,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (need_write) {
     // Сборка TX-кадра
     uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
-    uint8_t mode_hi_nibble = encode_nibble_from_mode(this->mode_);
-    uint8_t mode_hi = static_cast<uint8_t>(mode_hi_nibble << 4);
+    uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
-    tx_bytes_[19] = encode_temp_(this->target_c_);          // setpoint
+    // запись уставки напрямую
+    tx_bytes_[19] = encode_temp_(this->target_c_);
+
     tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
     tx_bytes_[17] = encode_sleep_byte_(this->sleep_stage_); // sleep
 
@@ -165,9 +169,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     tx_bytes_[36] = this->led_ ? 0b11000000 : 0b01000000;
 
     if (this->turbo_) {
-      tx_bytes_[19] = 0;       // override temperature
+      tx_bytes_[19] = this->target_c_; // turbo не трогаем уставку
       tx_bytes_[33] = turbo_bin;
-      tx_bytes_[35] = 0;       // override quiet
+      tx_bytes_[35] = 0;               // override quiet
     }
 
     this->writing_lock_ = true;
@@ -192,7 +196,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 // ---- Кодирование полей ----
 
 uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // Сформировать «старший полубайт»: берём nibble из {1,3,5,7,9} и <<4
+  // Сформировать «старший полубайт»: nibble {0..3} << 4
   return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
 }
 
@@ -359,7 +363,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   } else if (cmd == 101 /*0x65 ack*/) {
     this->handle_ack_101_();
   } else {
-    // неизвестные кадры игнорируем без логов
+    // неизвестные кадры игнорируем
   }
 }
 
@@ -368,7 +372,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
 
-  // Режим — читаем верхний полубайт и маппим по таблице «1,3,5,7,9»
+  // Режим — верхний полубайт по таблице FAN/HEAT/COOL/DRY
   uint8_t nib = static_cast<uint8_t>((bytes[18] >> 4) & 0x0F);
   this->mode_ = decode_mode_from_nibble(nib);
 
@@ -392,12 +396,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (code == 8) this->sleep_stage_ = 4;
   else this->sleep_stage_ = 0;
 
-  // Целевая температура (байт 19, код 2*n+1)
+  // Целевая температура (байт 19) — значение в °C напрямую
   uint8_t raw_set = bytes[19];
-  if (raw_set & 0x01) {
-    uint8_t c = raw_set >> 1;
-    if (c >= 18 && c <= 28) this->target_c_ = c;
-  }
+  if (raw_set >= 16 && raw_set <= 32) this->target_c_ = raw_set;
   this->target_temperature = this->target_c_;
 
   // Текущая температура воздуха (байт 20)

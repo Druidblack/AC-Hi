@@ -23,19 +23,19 @@ class Sensor;  // форвард, если USE_SENSOR не определён
 namespace esphome {
 namespace ac_hi {
 
-// Кадры Hisense (как в hisense.yaml):
+// Кадры Hisense:
 // Header: 0xF4 0xF5
 // Tail  : 0xF4 0xFB
-// bytes[4] — «декларированная длина», а полный размер кадра = bytes[4] + 9
+// bytes[4] — «декларированная длина», полный размер кадра = bytes[4] + 9
 static constexpr uint8_t HI_HDR0 = 0xF4;
 static constexpr uint8_t HI_HDR1 = 0xF5;
 static constexpr uint8_t HI_TAIL0 = 0xF4;
 static constexpr uint8_t HI_TAIL1 = 0xFB;
 
 // Ограничители, чтобы loop() не блокировал цикл приложения
-static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;   // не более 2 кадров за один проход loop()
-static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;  // и не более 20 мс парсинга за проход
-static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт делаем compaction
+static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;    // не более 2 кадров за один проход loop()
+static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;   // и не более 20 мс парсинга за проход
+static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт — compaction
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -84,7 +84,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x65, 0x00, 0x00, 0x00, // 0..16
       0x00, // [17] sleep
       0x00, // [18] power+mode
-      0x00, // [19] set temp (2*T+1)
+      0x00, // [19] set temp (°C, напрямую)
       0x00, // [20] current temp (RO)
       0x00, // [21] pipe temp (RO)
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
@@ -111,7 +111,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // ---- Отражение состояния ----
   bool power_on_{false};
-  uint8_t target_c_{24}; // 18..28
+  uint8_t target_c_{24}; // 16..32
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   climate::ClimateSwingMode swing_{climate::CLIMATE_SWING_OFF};
@@ -121,11 +121,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool led_{true};
   uint8_t sleep_stage_{0}; // 0..4
 
-  // Для подавления повторов статуса
+  // Для подавления повторов статуса (по сумме байтов)
   uint16_t last_status_crc_{0};
 
   // ---- Кодирование полей ----
-  uint8_t encode_temp_(uint8_t c) { return static_cast<uint8_t>((c << 1) | 0x01); }
+  uint8_t encode_temp_(uint8_t c) { return c; }  // запись уставки «как есть» в °C
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
   uint8_t encode_fan_byte_(climate::ClimateFanMode f);
   uint8_t encode_sleep_byte_(uint8_t stage);
