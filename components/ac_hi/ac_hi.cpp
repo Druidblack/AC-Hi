@@ -1,104 +1,104 @@
 #include "ac_hi.h"
-#include <cmath>
+#include "esphome/core/log.h"
 #include <algorithm>
+#include <cmath>
 
 namespace esphome {
 namespace ac_hi {
 
-// ---- Локальные хелперы для (де)кодирования режима ----
-// Целевая раскладка nibble (byte[18] >> 4):
-// 0x00 = FAN_ONLY, 0x01 = HEAT, 0x02 = COOL, 0x03 = DRY.
-// Иного здесь нет — AUTO не поддерживается и в HA не объявляется.
-static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
+static const char *const TAG = "ac_hi";
+
+// ----- Helpers for mode nibble (byte[18] >> 4) -----
+climate::ClimateMode ACHIClimate::decode_mode_from_nibble_(uint8_t nib) {
   switch (nib & 0x0F) {
     case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
     case 0x01: return climate::CLIMATE_MODE_HEAT;
     case 0x02: return climate::CLIMATE_MODE_COOL;
     case 0x03: return climate::CLIMATE_MODE_DRY;
-    default:   return climate::CLIMATE_MODE_COOL;  // fallback
+    default:   return climate::CLIMATE_MODE_FAN_ONLY;
   }
 }
-static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
+uint8_t ACHIClimate::encode_mode_to_nibble_(climate::ClimateMode m) {
   switch (m) {
     case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
-    case climate::CLIMATE_MODE_HEAT:     return 0x01;
-    case climate::CLIMATE_MODE_COOL:     return 0x02;
-    case climate::CLIMATE_MODE_DRY:      return 0x03;
-    default:                             return 0x02; // AUTO нет, используем COOL
+    case climate::CLIMATE_MODE_HEAT: return 0x01;
+    case climate::CLIMATE_MODE_COOL: return 0x02;
+    case climate::CLIMATE_MODE_DRY: return 0x03;
+    default: return 0x02; // default to COOL
   }
+}
+
+uint8_t ACHIClimate::pack_power_mode_() const {
+  uint8_t mode_nib = encode_mode_to_nibble_(this->mode_) & 0x0F;
+  uint8_t power_low = this->power_on_ ? 0x0C : 0x04; // matches legacy: ON=0x0C, OFF=0x04
+  return static_cast<uint8_t>((mode_nib << 4) | power_low);
 }
 
 void ACHIClimate::setup() {
-  this->mode = climate::CLIMATE_MODE_OFF;
-  this->target_temperature = 24;
-  this->fan_mode = climate::CLIMATE_FAN_AUTO;
-  this->swing_mode = climate::CLIMATE_SWING_OFF;
-  this->publish_state();
+  // Prepare a default TX state frame template (length 0x29 as in legacy)
+  // We only set fields we care about; the rest are zeros.
+  this->tx_bytes_.assign({
+    0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01,
+    0xFE, 0x01, 0x00, 0x00, 0x6A, // 0x6A = write state command in many firmwares
+    // payload starts at index 15 .. (len-4)
+  });
+  // pad payload to required size (0x29 total incl. header+crc)
+  while (this->tx_bytes_.size() < 0x29 - 2) this->tx_bytes_.push_back(0x00);
+  // Append dummy CRC and footer (will be fixed on send)
+  this->tx_bytes_.push_back(0x00);
+  this->tx_bytes_.push_back(0x00);
+  this->tx_bytes_.push_back(0xF4);
+  this->tx_bytes_.push_back(0xFB);
+
+  this->update();  // kick an initial query
 }
 
 void ACHIClimate::update() {
-  // Периодический опрос: короткий запрос статуса
-  if (!this->writing_lock_) {
-    this->send_query_status_();
-  }
+  // poll status
+  this->send_query_();
 }
 
 void ACHIClimate::loop() {
-  // Накапливаем входящие байты неблокирующе
-  uint8_t c;
-  while (this->read_byte(&c)) {
-    rx_.push_back(c);
-  }
+  this->handle_incoming_();
 
-  // Скользящее окно/компакция буфера
-  if (rx_start_ > RX_COMPACT_THRESHOLD) {
-    rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
-    rx_start_ = 0;
+  // If we queued a write and link is free, send
+  if (this->pending_write_ && !this->writing_lock_) {
+    this->pending_write_ = false;
+    this->send_state_frame_();
   }
-  if (rx_.size() - rx_start_ > 4096) {
-    size_t remain = rx_.size() - rx_start_;
-    if (remain >= 1 && rx_.back() == HI_HDR0) {
-      uint8_t keep = rx_.back();
-      rx_.clear();
-      rx_.push_back(keep);
-      rx_start_ = 0;
-    } else {
-      rx_.clear();
-      rx_start_ = 0;
-    }
-  }
-
-  // Пробуем извлечь кадры с ограничением по времени/количеству
-  this->try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
 }
 
 climate::ClimateTraits ACHIClimate::traits() {
-  climate::ClimateTraits t{};
-  t.set_supports_action(false);
-  // Без AUTO
+  climate::ClimateTraits t;
   t.set_supported_modes({
-    climate::CLIMATE_MODE_OFF,
-    climate::CLIMATE_MODE_COOL,
-    climate::CLIMATE_MODE_HEAT,
-    climate::CLIMATE_MODE_DRY,
-    climate::CLIMATE_MODE_FAN_ONLY
+      climate::CLIMATE_MODE_OFF,
+      climate::CLIMATE_MODE_COOL,
+      climate::CLIMATE_MODE_HEAT,
+      climate::CLIMATE_MODE_DRY,
+      climate::CLIMATE_MODE_FAN_ONLY,
   });
-  t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
-                             climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
-                             climate::CLIMATE_FAN_QUIET});
-  t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
-                               climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
-  if (enable_presets_) {
-    t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
-                             climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
-  }
+  t.set_supported_fan_modes({
+      climate::CLIMATE_FAN_AUTO,
+      climate::CLIMATE_FAN_LOW,
+      climate::CLIMATE_FAN_MEDIUM,
+      climate::CLIMATE_FAN_HIGH,
+  });
+  t.set_supported_custom_presets({});
+  t.set_supported_swing_modes({
+      climate::CLIMATE_SWING_OFF,
+      climate::CLIMATE_SWING_VERTICAL,
+      climate::CLIMATE_SWING_HORIZONTAL,
+      climate::CLIMATE_SWING_BOTH,
+  });
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(32);
   t.set_visual_temperature_step(1.0f);
-  t.set_supports_current_temperature(true);
   return t;
 }
 
+// === POWER BEHAVIOR ===
+// Card has no separate power; any mode != OFF should power on.
+// OFF turns power off. Changing ONLY temperature must not change power.
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool need_write = false;
 
@@ -106,9 +106,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
       this->power_on_ = false;
+      this->mode_ = climate::CLIMATE_MODE_COOL; // keep a sane default for next ON
     } else {
-      this->power_on_ = true;
       this->mode_ = m;
+      this->power_on_ = true;  // << required behavior
     }
     need_write = true;
   }
@@ -133,315 +134,126 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     need_write = true;
   }
 
-  if (call.get_preset().has_value()) {
-    auto p = *call.get_preset();
-    this->eco_ = (p == climate::CLIMATE_PRESET_ECO);
-    this->turbo_ = (p == climate::CLIMATE_PRESET_BOOST);
-    this->sleep_stage_ = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
-    need_write = true;
-  }
-
   if (need_write) {
-    // Сборка TX-кадра
-    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
-    uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
-    tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
-
-    // запись уставки напрямую
-    tx_bytes_[19] = encode_temp_(this->target_c_);
-
-    tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
-    tx_bytes_[17] = encode_sleep_byte_(this->sleep_stage_); // sleep
-
-    bool v_swing = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-    bool h_swing = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-    uint8_t updown_bin = encode_swing_ud_(v_swing);
-    uint8_t leftright_bin = encode_swing_lr_(h_swing);
-    tx_bytes_[32] = static_cast<uint8_t>(updown_bin + leftright_bin);
-
-    uint8_t turbo_bin = this->turbo_ ? 0b00001100 : 0b00000100;
-    uint8_t eco_bin = this->eco_ ? 0b00110000 : 0b00000000;
-    tx_bytes_[33] = (this->turbo_ ? turbo_bin : (eco_bin ? eco_bin : 0));
-
-    this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
-    tx_bytes_[35] = this->quiet_ ? 0b00110000 : 0b00000000;
-
-    tx_bytes_[36] = this->led_ ? 0b11000000 : 0b01000000;
-
-    if (this->turbo_) {
-      tx_bytes_[19] = this->target_c_; // turbo не трогаем уставку
-      tx_bytes_[33] = turbo_bin;
-      tx_bytes_[35] = 0;               // override quiet
-    }
-
-    this->writing_lock_ = true;
     this->pending_write_ = true;
-    this->send_write_changes_();
-  }
-
-  // Оптимистично публикуем ожидаемое состояние
-  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
-  this->target_temperature = this->target_c_;
-  this->fan_mode = this->fan_;
-  this->swing_mode = this->swing_;
-  if (enable_presets_) {
-    if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-    else this->preset = climate::CLIMATE_PRESET_NONE;
-  }
-  this->publish_state();
-}
-
-// ---- Кодирование полей ----
-
-uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // Сформировать «старший полубайт»: nibble {0..3} << 4
-  return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
-}
-
-uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // Соответствие: AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16; при записи +1
-  uint8_t code = 1;
-  switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
-    case climate::CLIMATE_FAN_LOW:    code = 12; break;
-    case climate::CLIMATE_FAN_MEDIUM: code = 14; break;
-    case climate::CLIMATE_FAN_HIGH:   code = 16; break;
-    case climate::CLIMATE_FAN_QUIET:  code = 10; break;
-    default:                          code = 1;  break;
-  }
-  return static_cast<uint8_t>(code + 1);
-}
-
-uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  // listix_to_sleep_codes {0,1,2,4,8} -> (code<<1)|1
-  uint8_t code = 0;
-  switch (stage) {
-    case 1: code = 1; break;
-    case 2: code = 2; break;
-    case 3: code = 4; break;
-    case 4: code = 8; break;
-    default: code = 0; break;
-  }
-  return static_cast<uint8_t>((code << 1) | 0x01);
-}
-
-uint8_t ACHIClimate::encode_swing_ud_(bool on) {
-  return on ? 0b11000000 : 0b01000000;
-}
-uint8_t ACHIClimate::encode_swing_lr_(bool on) {
-  return on ? 0b00110000 : 0b00010000;
-}
-
-// ---- Транспорт/CRC ----
-
-void ACHIClimate::send_query_status_() {
-  for (auto b : this->query_) this->write_byte(b);
-  this->flush();
-}
-
-void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) {
-  // сумма байтов с 2 по (len-4)
-  const int n = static_cast<int>(buf.size());
-  uint16_t csum = 0;
-  for (int i = 2; i < n - 4; i++) csum = static_cast<uint16_t>(csum + buf[i]);
-  buf[n - 4] = static_cast<uint8_t>((csum & 0xFF00) >> 8);
-  buf[n - 3] = static_cast<uint8_t>(csum & 0x00FF);
-}
-
-bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum) const {
-  if (buf.size() < 8) return false;
-  const size_t n = buf.size();
-  uint16_t csum = 0;
-  for (size_t i = 2; i < n - 4; i++) csum = static_cast<uint16_t>(csum + buf[i]);
-  uint8_t cr1 = static_cast<uint8_t>((csum & 0xFF00) >> 8);
-  uint8_t cr2 = static_cast<uint8_t>(csum & 0x00FF);
-  if (out_sum) *out_sum = csum;
-  return (buf[n - 4] == cr1) && (buf[n - 3] == cr2);
-}
-
-void ACHIClimate::send_write_changes_() {
-  auto frame = this->tx_bytes_;
-  this->calc_and_patch_crc_(frame);
-  for (auto b : frame) this->write_byte(b);
-  this->flush();
-}
-
-// ---- RX сканер/парсер ----
-
-void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
-  std::vector<uint8_t> frame;
-  uint8_t handled = 0;
-  const uint32_t start = esphome::millis();
-
-  while (handled < MAX_FRAMES_PER_LOOP &&
-         (esphome::millis() - start) < budget_ms &&
-         this->extract_next_frame_(frame)) {
-
-    // На входе используем сумму как «детектор изменений», а не жёсткий CRC-drop
-    uint16_t sum = 0;
-    for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
-
-    // Разбор
-    this->handle_frame_(frame);
-    handled++;
-
-    // Сохраняем последнюю сумму, чтобы подавлять повторы
-    last_status_crc_ = sum;
+    this->writing_lock_ = false;  // allow immediate send
+    this->publish_state();
   }
 }
 
-bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
-  frame.clear();
+void ACHIClimate::send_query_() {
+  // Simple write of the short status request
+  this->write_array(this->query_.data(), this->query_.size());
+  this->last_query_ms_ = millis();
+}
 
-  if (rx_.size() <= rx_start_ + 5) return false;
+uint16_t ACHIClimate::crc16_sum_(const std::vector<uint8_t> &buf, size_t start, size_t end) {
+  uint32_t sum = 0;
+  for (size_t i = start; i < end; i++) sum += buf[i];
+  return static_cast<uint16_t>(sum & 0xFFFF);
+}
 
-  // 1) Ищем заголовок F4 F5 начиная с rx_start_
-  size_t i = rx_start_;
-  bool found_header = false;
-  for (; i + 1 < rx_.size(); i++) {
-    if (rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1) {
-      found_header = true;
+void ACHIClimate::send_state_frame_() {
+  // Update dynamic fields before sending:
+
+  // Byte 18: power + mode
+  if (this->tx_bytes_.size() > 18) this->tx_bytes_[18] = this->pack_power_mode_();
+
+  // Byte 19: target temperature with REQUIRED ENCODING (C<<1 | 1)
+  if (this->tx_bytes_.size() > 19) this->tx_bytes_[19] = encode_temp_(this->target_c_);
+
+  // Fan speed (byte 16) and swings (byte 32) are left as-is to avoid changing unrelated logic.
+
+  // Recompute CRC over payload between index 2 and len-4 (exclusive of CRC+tail)
+  if (this->tx_bytes_.size() >= 8) {
+    size_t end = this->tx_bytes_.size() - 4;
+    uint16_t crc = crc16_sum_(this->tx_bytes_, 2, end);
+    this->tx_bytes_[end + 0] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    this->tx_bytes_[end + 1] = static_cast<uint8_t>(crc & 0xFF);
+  }
+
+  this->write_array(this->tx_bytes_.data(), this->tx_bytes_.size());
+  this->writing_lock_ = true;
+}
+
+void ACHIClimate::handle_incoming_() {
+  while (this->available()) {
+    uint8_t b;
+    if (!this->read_byte(&b)) break;
+    this->rx_bytes_.push_back(b);
+
+    // Very naive frame reassembly: look for trailer 0xF4 0xFB and a header 0xF4 0xF5
+    if (this->rx_bytes_.size() >= 2 &&
+        this->rx_bytes_[this->rx_bytes_.size() - 2] == 0xF4 &&
+        this->rx_bytes_[this->rx_bytes_.size() - 1] == 0xFB) {
+      // find last header
+      size_t start = 0;
+      for (size_t i = 0; i + 1 < this->rx_bytes_.size(); i++) {
+        if (this->rx_bytes_[i] == 0xF4 && this->rx_bytes_[i+1] == 0xF5) { start = i; break; }
+      }
+      std::vector<uint8_t> frame(this->rx_bytes_.begin() + start, this->rx_bytes_.end());
+      this->rx_bytes_.clear();
+      this->parse_frame_(frame);
+    }
+  }
+}
+
+void ACHIClimate::parse_frame_(const std::vector<uint8_t> &frame) {
+  if (frame.size() < 10) return;
+  if (!(frame[0] == 0xF4 && frame[1] == 0xF5)) return;
+
+  uint8_t cmd = 0;
+  if (frame.size() > 14) cmd = frame[14];
+
+  switch (cmd) {
+    case 0x66: // short status
+    case 0x6B: // long status variants sometimes report as 0x6B with code 0x102
+      this->parse_status_102_(frame);
       break;
-    }
-  }
-  if (!found_header) {
-    if (!rx_.empty() && rx_.back() == HI_HDR0) {
-      uint8_t keep = rx_.back();
-      rx_.clear();
-      rx_.push_back(keep);
-      rx_start_ = 0;
-    } else {
-      rx_.clear();
-      rx_start_ = 0;
-    }
-    return false;
-  }
-
-  rx_start_ = i;
-
-  // 2) Попытка среза по объявленной длине: полный размер = bytes[4] + 9
-  if (rx_.size() > rx_start_ + 5) {
-    uint8_t decl = rx_[rx_start_ + 4];
-    size_t expected_total = static_cast<size_t>(decl) + 9U;
-
-    if (rx_.size() >= rx_start_ + expected_total) {
-      frame.insert(frame.end(),
-                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
-                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total));
-      rx_start_ += expected_total;
-      return true;
-    }
-  }
-
-  // 3) Иначе — до первого хвоста F4 FB
-  size_t j = rx_start_ + 2;
-  bool found_tail = false;
-  for (; j + 1 < rx_.size(); j++) {
-    if (rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1) {
-      found_tail = true;
+    case 0x65: // ACK to write (observed as 0x65/0x101)
+    case 0x6A:
+    case 0x101:
+    case 0x00: // some firmwares do weird things; unlock writes on any ack-ish
+      this->handle_ack_101_();
       break;
-    }
+    default:
+      // ignore
+      break;
   }
-  if (!found_tail) return false;
-
-  frame.insert(frame.end(),
-               rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
-               rx_.begin() + static_cast<std::ptrdiff_t>(j + 2));
-  rx_start_ = j + 2;
-  return true;
 }
 
-void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
-  if (b.size() < 20) return;
+void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &frame) {
+  // Defensive: verify length
+  if (frame.size() < 40) return;
 
-  const uint8_t cmd = b[13];
+  // Byte 18: power + mode
+  uint8_t b18 = frame[18];
+  uint8_t mode_nib = (b18 >> 4) & 0x0F;
+  uint8_t power_low = b18 & 0x0F;
+  this->power_on_ = (power_low == 0x0C); // 0x0C => ON, 0x04 => OFF
+  this->mode_ = decode_mode_from_nibble_(mode_nib);
 
-  if (cmd == 102 /*0x66 status resp*/ ) {
-    this->parse_status_102_(b);
-  } else if (cmd == 101 /*0x65 ack*/) {
-    this->handle_ack_101_();
+  // Byte 19: target temperature (SMART DECODE)
+  uint8_t raw_t = frame[19];
+  uint8_t dec = decode_temp_(raw_t);
+  this->target_c_ = dec;
+  this->target_temperature = dec;
+
+  // Publish minimal state; keep other aspects unchanged
+  if (!this->power_on_) {
+    // HA expects OFF mode when powered down
+    this->mode = climate::CLIMATE_MODE_OFF;
   } else {
-    // неизвестные кадры игнорируем
+    this->mode = this->mode_;
   }
-}
-
-void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
-  // Питание (байт 18, бит 3)
-  bool power = (bytes[18] & 0b00001000) != 0;
-  this->power_on_ = power;
-
-  // Режим — верхний полубайт по таблице FAN/HEAT/COOL/DRY
-  uint8_t nib = static_cast<uint8_t>((bytes[18] >> 4) & 0x0F);
-  this->mode_ = decode_mode_from_nibble(nib);
-
-  // Скорость вентилятора (байт 16)
-  uint8_t raw_wind = bytes[16];
-  climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
-  if (raw_wind == 1 || raw_wind == 2) new_fan = climate::CLIMATE_FAN_AUTO;
-  else if (raw_wind == 11) new_fan = climate::CLIMATE_FAN_QUIET;
-  else if (raw_wind == 13) new_fan = climate::CLIMATE_FAN_LOW;
-  else if (raw_wind == 15) new_fan = climate::CLIMATE_FAN_MEDIUM;
-  else if (raw_wind == 17) new_fan = climate::CLIMATE_FAN_HIGH;
-  this->fan_ = new_fan;
-
-  // Sleep (байт 17)
-  uint8_t raw_sleep = bytes[17];
-  uint8_t code = (raw_sleep >> 1);
-  if (code == 0) this->sleep_stage_ = 0;
-  else if (code == 1) this->sleep_stage_ = 1;
-  else if (code == 2) this->sleep_stage_ = 2;
-  else if (code == 4) this->sleep_stage_ = 3;
-  else if (code == 8) this->sleep_stage_ = 4;
-  else this->sleep_stage_ = 0;
-
-  // Целевая температура (байт 19) — значение в °C напрямую
-  uint8_t raw_set = bytes[19];
-  if (raw_set >= 16 && raw_set <= 32) this->target_c_ = raw_set;
-  this->target_temperature = this->target_c_;
-
-  // Текущая температура воздуха (байт 20)
-  uint8_t tair = bytes[20];
-  this->current_temperature = tair;
-
-  // Температура трубки (байт 21)
-#ifdef USE_SENSOR
-  if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(bytes[21]);
-#endif
-
-  // Turbo/Eco/Quiet/LED
-  uint8_t b35 = bytes[35];
-  this->turbo_ = (b35 & 0b00000010) != 0;       // turbo_mask = 0b00000010
-  this->eco_   = (b35 & 0b00000100) != 0;       // eco_mask   = 0b00000100
-  this->quiet_ = (bytes[36] & 0b00000100) != 0; // quiet      в 36-м
-  this->led_   = (bytes[37] & 0b10000000) != 0; // LED        в 37-м
-
-  // Swing (байт 35: updown bit7, leftright bit6)
-  bool updown = (bytes[35] & 0b10000000) != 0;
-  bool leftright = (bytes[35] & 0b01000000) != 0;
-  if (updown && leftright) this->swing_ = climate::CLIMATE_SWING_BOTH;
-  else if (updown) this->swing_ = climate::CLIMATE_SWING_VERTICAL;
-  else if (leftright) this->swing_ = climate::CLIMATE_SWING_HORIZONTAL;
-  else this->swing_ = climate::CLIMATE_SWING_OFF;
-
-  // Публикуем
-  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
-  this->fan_mode = this->fan_;
-  this->swing_mode = this->swing_;
-  if (enable_presets_) {
-    if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-    else this->preset = climate::CLIMATE_PRESET_NONE;
-  }
+  this->current_temperature = NAN; // not provided here
   this->publish_state();
 }
 
 void ACHIClimate::handle_ack_101_() {
   this->writing_lock_ = false;
-  this->pending_write_ = false;
+  // do not auto-query here; update() will handle periodic polling
 }
 
-} // namespace ac_hi
-} // namespace esphome
+}  // namespace ac_hi
+}  // namespace esphome
