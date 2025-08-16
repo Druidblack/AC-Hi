@@ -126,7 +126,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // ---- Кодирование полей ----
   uint8_t encode_temp_(uint8_t c) {
-    return static_cast<uint8_t>(std::max<uint8_t>(16, std::min<uint8_t>(30, c)));
+    return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
   }
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
   uint8_t encode_fan_byte_(climate::ClimateFanMode f);

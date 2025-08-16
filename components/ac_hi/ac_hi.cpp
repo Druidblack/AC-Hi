@@ -11,20 +11,20 @@ namespace ac_hi {
 // Иного здесь нет — AUTO не поддерживается и в HA не объявляется.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
-    case 0x00: return climate::CLIMATE_MODE_AUTO;
-    case 0x01: return climate::CLIMATE_MODE_HEAT;
-    case 0x02: return climate::CLIMATE_MODE_COOL;
-    case 0x03: return climate::CLIMATE_MODE_DRY;
+    case 0x01: return climate::CLIMATE_MODE_FAN_ONLY;
+    case 0x03: return climate::CLIMATE_MODE_HEAT;
+    case 0x05: return climate::CLIMATE_MODE_COOL;
+    case 0x07: return climate::CLIMATE_MODE_DRY;
     default:   return climate::CLIMATE_MODE_COOL;  // fallback
   }
 }
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   switch (m) {
-    case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
-    case climate::CLIMATE_MODE_HEAT:     return 0x01;
-    case climate::CLIMATE_MODE_COOL:     return 0x02;
-    case climate::CLIMATE_MODE_DRY:      return 0x03;
-    default:                             return 0x02; // AUTO нет, используем COOL
+    case climate::CLIMATE_MODE_FAN_ONLY: return 0x01;
+    case climate::CLIMATE_MODE_HEAT:     return 0x03;
+    case climate::CLIMATE_MODE_COOL:     return 0x05;
+    case climate::CLIMATE_MODE_DRY:      return 0x07;
+    default:                             return 0x05; // AUTO нет, используем COOL
   }
 }
 
@@ -80,8 +80,7 @@ climate::ClimateTraits ACHIClimate::traits() {
     climate::CLIMATE_MODE_COOL,
     climate::CLIMATE_MODE_HEAT,
     climate::CLIMATE_MODE_DRY,
-    climate::CLIMATE_MODE_FAN_ONLY,
-    climate::CLIMATE_MODE_AUTO,
+    climate::CLIMATE_MODE_FAN_ONLY
   });
   t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
                              climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
@@ -143,7 +142,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (need_write) {
     // Сборка TX-кадра
-    uint8_t power_bin = this->power_on_ ? 0b00001000 : 0b00000000;  // low nibble
+    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
     uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
