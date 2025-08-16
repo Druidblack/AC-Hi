@@ -14,7 +14,7 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
     case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
     case 0x01: return climate::CLIMATE_MODE_HEAT;
     case 0x02: return climate::CLIMATE_MODE_COOL;
-    case 0x03: return climate::CLIMATE_MODE_DRY;
+    case 0x04: return climate::CLIMATE_MODE_DRY;
     default:   return climate::CLIMATE_MODE_COOL;  // fallback
   }
 }
