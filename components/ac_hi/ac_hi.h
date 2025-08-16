@@ -4,6 +4,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"  // esphome::millis()
 
 // Подключаем заголовок сенсоров только если платформа sensor реально присутствует в билде
 #ifdef USE_SENSOR
@@ -12,6 +13,7 @@
 
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 
 namespace esphome {
 namespace sensor {
@@ -22,14 +24,19 @@ class Sensor;  // форвард, если USE_SENSOR не определён
 namespace esphome {
 namespace ac_hi {
 
-// Кадры Hisense: потоковая передача, маркеры начала/конца кадра такие же, как в YAML
+// Кадры Hisense (как в hisense.yaml):
 // Header: 0xF4 0xF5
 // Tail  : 0xF4 0xFB
-// Внутри есть поле "длина" (байт [4]) и 2-байтный CRC (сумма с 2 по n-4)
+// bytes[4] — «декларированная длина», а полный размер кадра = bytes[4] + 9
 static constexpr uint8_t HI_HDR0 = 0xF4;
 static constexpr uint8_t HI_HDR1 = 0xF5;
 static constexpr uint8_t HI_TAIL0 = 0xF4;
 static constexpr uint8_t HI_TAIL1 = 0xFB;
+
+// Ограничители, чтобы loop() не блокировал цикл приложения (см. рекомендации ESPHome)
+static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;   // не более 2 кадров за один проход loop()
+static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;  // и не более 20 мс парсинга за проход
+static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт делаем compaction
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -57,8 +64,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
 
   // RX фреймер/парсер
-  void try_parse_frames_from_buffer_();                    // сканер потока
-  bool extract_next_frame_(std::vector<uint8_t> &frame);   // достаёт [F4 F5 ... F4 FB]
+  void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS); // сканер потока с бюджетом
+  bool extract_next_frame_(std::vector<uint8_t> &frame);                       // достаёт [F4 F5 ... F4 FB]
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
@@ -66,8 +73,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Логирование/дампы
   void log_hex_frame_(const char *dir, const std::vector<uint8_t> &data, const char *note = nullptr) const;
 
-  // Буфер входящего потока
+  // Буфер входящего потока (скользящее окно: rx_start_ — смещение начала данных)
   std::vector<uint8_t> rx_;
+  size_t rx_start_{0};
+
   bool writing_lock_{false};
   bool pending_write_{false};
   uint32_t last_rx_ms_{0};

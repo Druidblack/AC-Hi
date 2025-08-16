@@ -25,18 +25,35 @@ void ACHIClimate::update() {
 }
 
 void ACHIClimate::loop() {
-  // Накапливаем входящие байты
+  // Накапливаем входящие байты неблокирующе
   uint8_t c;
   while (this->read_byte(&c)) {
     rx_.push_back(c);
-    // чтобы буфер не рос бесконечно
-    if (rx_.size() > 2048) {
-      rx_.erase(rx_.begin(), rx_.begin() + 1024);
+  }
+
+  // Если буфер слишком разросся — мягкая компакция (по скользящему окну)
+  if (rx_start_ > RX_COMPACT_THRESHOLD) {
+    // удаляем уже прочитанную часть
+    rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
+    rx_start_ = 0;
+  }
+  // Ограничим абсолютный размер буфера
+  if (rx_.size() - rx_start_ > 4096) {
+    // сохраняем хвост на случай частичного хедера
+    size_t remain = rx_.size() - rx_start_;
+    if (remain >= 1 && rx_[rx_.size() - 1] == HI_HDR0) {
+      uint8_t keep = rx_[rx_.size() - 1];
+      rx_.clear();
+      rx_.push_back(keep);
+      rx_start_ = 0;
+    } else {
+      rx_.clear();
+      rx_start_ = 0;
     }
   }
 
-  // Пробуем извлечь все полные кадры из буфера
-  this->try_parse_frames_from_buffer_();
+  // Пробуем извлечь кадры с ограничением по времени/количеству (чтобы не блокировать цикл)
+  this->try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
 }
 
 climate::ClimateTraits ACHIClimate::traits() {
@@ -115,7 +132,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     bool h_swing = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
     uint8_t updown_bin = encode_swing_ud_(v_swing);
     uint8_t leftright_bin = encode_swing_lr_(h_swing);
-    tx_bytes_[32] = updown_bin + leftright_bin;
+    tx_bytes_[32] = static_cast<uint8_t>(updown_bin + leftright_bin);
 
     uint8_t turbo_bin = this->turbo_ ? 0b00001100 : 0b00000100;
     uint8_t eco_bin = this->eco_ ? 0b00110000 : 0b00000000;
@@ -273,39 +290,48 @@ void ACHIClimate::log_hex_frame_(const char *dir, const std::vector<uint8_t> &da
 
 // ---- RX сканер/парсер ----
 
-void ACHIClimate::try_parse_frames_from_buffer_() {
-  // Ищем и извлекаем все полные [F4 F5 ... F4 FB] из rx_
+void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   std::vector<uint8_t> frame;
-  size_t safety = 0;
-  while (this->extract_next_frame_(frame)) {
+  uint8_t handled = 0;
+  const uint32_t start = esphome::millis();  // использовать HAL ESPHome, не Arduino String/таймеры :contentReference[oaicite:1]{index=1}
+
+  while (handled < MAX_FRAMES_PER_LOOP &&
+         (esphome::millis() - start) < budget_ms &&
+         this->extract_next_frame_(frame)) {
+
     // Логируем принятый кадр
     this->log_hex_frame_("RX", frame, "raw");
+
     // Валидация CRC
     uint16_t sum = 0;
     if (!this->validate_crc_(frame, &sum)) {
       ESP_LOGW(TAG, "<< Drop: CRC mismatch (sum=0x%04X, got=%02X %02X)", sum,
                frame[frame.size() - 4], frame[frame.size() - 3]);
+      handled++;
       continue;
     }
-    // Небольшая диагностика по длине
+
+    // Информативная диагностика длины (полный размер = decl_len + 9)
     if (frame.size() > 5) {
       uint8_t decl = frame[4];
-      ESP_LOGV(TAG, "<< Declared len=0x%02X, actual bytes=%u", decl, static_cast<unsigned>(frame.size()));
+      ESP_LOGV(TAG, "<< Declared len=0x%02X, expected_total=%u, actual=%u",
+               decl, static_cast<unsigned>(decl + 9U), static_cast<unsigned>(frame.size()));
     }
-    // Передаём на разбор
-    this->handle_frame_(frame);
 
-    // Против зацикливания на испорченном потоке
-    if (++safety > 32) break;
+    // Разбор
+    this->handle_frame_(frame);
+    handled++;
   }
 }
 
 bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   frame.clear();
-  if (rx_.size() < 6) return false;
 
-  // 1) Ищем заголовок F4 F5
-  size_t i = 0;
+  // Данные есть?
+  if (rx_.size() <= rx_start_ + 5) return false;
+
+  // 1) Ищем заголовок F4 F5 начиная с rx_start_
+  size_t i = rx_start_;
   bool found_header = false;
   for (; i + 1 < rx_.size(); i++) {
     if (rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1) {
@@ -314,21 +340,40 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     }
   }
   if (!found_header) {
-    // Сохраняем последний байт, если он равен первому байту заголовка, на случай частичного совпадения
+    // Хедера пока нет — оставим последний возможный байт на случай частичного совпадения
     if (!rx_.empty() && rx_.back() == HI_HDR0) {
       uint8_t keep = rx_.back();
       rx_.clear();
       rx_.push_back(keep);
+      rx_start_ = 0;
     } else {
       rx_.clear();
+      rx_start_ = 0;
     }
     return false;
   }
-  // Отбрасываем мусор до заголовка
-  if (i > 0) rx_.erase(rx_.begin(), rx_.begin() + i);
 
-  // 2) Ищем хвост F4 FB после заголовка
-  size_t j = 2;  // поиск начнём сразу после заголовка
+  // Сдвигаем начало окна на заголовок
+  rx_start_ = i;
+
+  // 2) При достаточной длине можем вычислить ожидаемый конец из decl_len
+  // Полный размер кадра = bytes[4] + 9 (см. hisense.yaml: у TX 0x29 => 50 байт)
+  if (rx_.size() > rx_start_ + 5) {
+    uint8_t decl = rx_[rx_start_ + 4];
+    size_t expected_total = static_cast<size_t>(decl) + 9U;
+
+    // Если буфер уже содержит весь кадр по объявленной длине — срезаем по длине
+    if (rx_.size() >= rx_start_ + expected_total) {
+      frame.insert(frame.end(),
+                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total));
+      rx_start_ += expected_total;
+      return true;
+    }
+  }
+
+  // 3) Иначе пробуем до первого хвоста F4 FB
+  size_t j = rx_start_ + 2;
   bool found_tail = false;
   for (; j + 1 < rx_.size(); j++) {
     if (rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1) {
@@ -341,12 +386,10 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     return false;
   }
 
-  // 3) Извлекаем кадр [0 .. j+1]
-  frame.insert(frame.end(), rx_.begin(), rx_.begin() + j + 2);
-
-  // 4) Удаляем его из буфера
-  rx_.erase(rx_.begin(), rx_.begin() + j + 2);
-
+  frame.insert(frame.end(),
+               rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+               rx_.begin() + static_cast<std::ptrdiff_t>(j + 2));
+  rx_start_ = j + 2;
   return true;
 }
 
@@ -356,7 +399,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   const uint8_t cmd = b[13];
   const uint8_t typ = b[2];  // разные блоки могут присылать 0/1 — логируем и принимаем
 
-  ESP_LOGV(TAG, "<< Frame: cmd=%u (0x%02X), typ=%u, byte[4]=0x%02X", cmd, cmd, typ, (b.size() > 5 ? b[4] : 0));
+  ESP_LOGV(TAG, "<< Frame: cmd=%u (0x%02X), typ=%u, decl_len=0x%02X", cmd, cmd, typ, (b.size() > 5 ? b[4] : 0));
 
   if (cmd == 102 /*0x66 status resp*/ ) {
     this->parse_status_102_(b);
