@@ -8,6 +8,32 @@ namespace ac_hi {
 
 static const char *const TAG = "ac_hi.climate";
 
+// ---- Локальные хелперы для (де)кодирования режима ----
+// У конкретных плат Hisense попадается раскладка nibble режима (byte[18] >> 4):
+// 0x01=HEAT, 0x03=COOL, 0x05=DRY, 0x07=FAN_ONLY, 0x09=AUTO.
+// (Именно по ней корректно совпадают индикации HA и самого блока.)
+static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
+  switch (nib & 0x0F) {
+    case 0x01: return climate::CLIMATE_MODE_HEAT;
+    case 0x03: return climate::CLIMATE_MODE_COOL;
+    case 0x05: return climate::CLIMATE_MODE_DRY;
+    case 0x07: return climate::CLIMATE_MODE_FAN_ONLY;
+    case 0x09: return climate::CLIMATE_MODE_AUTO;
+    default:   return climate::CLIMATE_MODE_AUTO;  // fallback
+  }
+}
+// Обратное соответствие (для формирования TX): хотим получить nibble из набора {1,3,5,7,9}
+static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
+  switch (m) {
+    case climate::CLIMATE_MODE_HEAT:     return 0x01;
+    case climate::CLIMATE_MODE_COOL:     return 0x03;
+    case climate::CLIMATE_MODE_DRY:      return 0x05;
+    case climate::CLIMATE_MODE_FAN_ONLY: return 0x07;
+    case climate::CLIMATE_MODE_AUTO:
+    default:                             return 0x09;
+  }
+}
+
 void ACHIClimate::setup() {
   ESP_LOGI(TAG, "Setup AC-Hi climate");
   this->mode = climate::CLIMATE_MODE_OFF;
@@ -33,16 +59,14 @@ void ACHIClimate::loop() {
 
   // Если буфер слишком разросся — мягкая компакция (по скользящему окну)
   if (rx_start_ > RX_COMPACT_THRESHOLD) {
-    // удаляем уже прочитанную часть
     rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
     rx_start_ = 0;
   }
   // Ограничим абсолютный размер буфера
   if (rx_.size() - rx_start_ > 4096) {
-    // сохраняем хвост на случай частичного хедера
     size_t remain = rx_.size() - rx_start_;
-    if (remain >= 1 && rx_[rx_.size() - 1] == HI_HDR0) {
-      uint8_t keep = rx_[rx_.size() - 1];
+    if (remain >= 1 && rx_.back() == HI_HDR0) {
+      uint8_t keep = rx_.back();
       rx_.clear();
       rx_.push_back(keep);
       rx_start_ = 0;
@@ -120,9 +144,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (need_write) {
     // Сборка TX-кадра
-    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // из YAML
-    uint8_t mode_hi = encode_mode_hi_nibble_(this->mode_);
-    tx_bytes_[18] = power_bin + mode_hi;
+    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
+    uint8_t mode_hi_nibble = encode_nibble_from_mode(this->mode_);
+    // Протокол требует ((code<<1)|1) << 4, где code из {0,1,2,3,4}
+    // Для набора выше это просто nibble из {1,3,5,7,9} << 4
+    uint8_t mode_hi = static_cast<uint8_t>(mode_hi_nibble << 4);
+    tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
     tx_bytes_[19] = encode_temp_(this->target_c_);          // setpoint
     tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
@@ -171,17 +198,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 // ---- Кодирование полей ----
 
 uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // {fan_only,heat,cool,dry,auto} -> ((code<<1)|1) << 4
-  uint8_t code = 4;
-  switch (m) {
-    case climate::CLIMATE_MODE_FAN_ONLY: code = 0; break;
-    case climate::CLIMATE_MODE_HEAT:     code = 1; break;
-    case climate::CLIMATE_MODE_COOL:     code = 2; break;
-    case climate::CLIMATE_MODE_DRY:      code = 3; break;
-    case climate::CLIMATE_MODE_AUTO:     code = 4; break;
-    default:                             code = 4; break;
-  }
-  return static_cast<uint8_t>(((code << 1) | 0x01) << 4);
+  // Сформировать «старший полубайт»: берём nibble из {1,3,5,7,9} и просто <<4
+  return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
 }
 
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
@@ -302,14 +320,11 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     // Логируем принятый кадр
     this->log_hex_frame_("RX", frame, "raw");
 
-    // Для RX используем сумму байтов как «детектор изменений» (как в hisense.yaml),
-    // а НЕ жёсткую проверку CRC — разные ревизии блоков могут иметь иные поля/счётчики.
-    // (При несоответствии «классическому» CRC кадр всё равно разбираем.)
+    // На входе используем сумму как «детектор изменений», а не жёсткий CRC-drop
     uint16_t sum = 0;
     for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
     ESP_LOGV(TAG, "<< RX sum(bytes[2..n-5])=0x%04X", sum);
 
-    // Информативная диагностика длины (полный размер = decl_len + 9)
     if (frame.size() > 5) {
       uint8_t decl = frame[4];
       ESP_LOGV(TAG, "<< Declared len=0x%02X, expected_total=%u, actual=%u",
@@ -325,7 +340,6 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
 bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   frame.clear();
 
-  // Данные есть?
   if (rx_.size() <= rx_start_ + 5) return false;
 
   // 1) Ищем заголовок F4 F5 начиная с rx_start_
@@ -338,7 +352,6 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     }
   }
   if (!found_header) {
-    // Хедера пока нет — оставим последний возможный байт на случай частичного совпадения
     if (!rx_.empty() && rx_.back() == HI_HDR0) {
       uint8_t keep = rx_.back();
       rx_.clear();
@@ -351,16 +364,13 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     return false;
   }
 
-  // Сдвигаем начало окна на заголовок
   rx_start_ = i;
 
-  // 2) При достаточной длине можем вычислить ожидаемый конец из decl_len
-  // Полный размер кадра = bytes[4] + 9 (см. примеры: TX 0x29 => 50 байт; RX 0x8D => 150 байт)
+  // 2) Попытка среза по объявленной длине
   if (rx_.size() > rx_start_ + 5) {
     uint8_t decl = rx_[rx_start_ + 4];
     size_t expected_total = static_cast<size_t>(decl) + 9U;
 
-    // Если буфер уже содержит весь кадр по объявленной длине — срезаем по длине
     if (rx_.size() >= rx_start_ + expected_total) {
       frame.insert(frame.end(),
                    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
@@ -370,7 +380,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     }
   }
 
-  // 3) Иначе пробуем до первого хвоста F4 FB
+  // 3) Иначе — до первого хвоста F4 FB
   size_t j = rx_start_ + 2;
   bool found_tail = false;
   for (; j + 1 < rx_.size(); j++) {
@@ -379,10 +389,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
       break;
     }
   }
-  if (!found_tail) {
-    // Кадр ещё не полный
-    return false;
-  }
+  if (!found_tail) return false;
 
   frame.insert(frame.end(),
                rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
@@ -395,7 +402,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   if (b.size() < 20) return;
 
   const uint8_t cmd = b[13];
-  const uint8_t typ = b[2];  // разные блоки могут присылать 0/1 — логируем и принимаем
+  const uint8_t typ = b[2];
 
   ESP_LOGV(TAG, "<< Frame: cmd=%u (0x%02X), typ=%u, decl_len=0x%02X", cmd, cmd, typ, (b.size() > 5 ? b[4] : 0));
 
@@ -409,7 +416,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
-  // Дополнительная "антиповторная" проверка (по сумме)
+  // Детектор изменений (сумма)
   uint16_t crc = 0;
   for (size_t i = 2; i < bytes.size() - 4; i++) crc = static_cast<uint16_t>(crc + bytes[i]);
   if (crc == last_status_crc_) {
@@ -422,17 +429,10 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
 
-  // Режим (старший полубайт байта 18)
-  uint8_t mode_code = (bytes[18] >> 4) & 0x0F;
-  climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
-  switch (mode_code) {
-    case 0x01: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;  // (0<<1 |1) = 1
-    case 0x03: new_mode = climate::CLIMATE_MODE_HEAT; break;      // (1<<1 |1) = 3
-    case 0x05: new_mode = climate::CLIMATE_MODE_COOL; break;      // (2<<1 |1) = 5
-    case 0x07: new_mode = climate::CLIMATE_MODE_DRY; break;       // (3<<1 |1) = 7
-    case 0x09: new_mode = climate::CLIMATE_MODE_AUTO; break;      // (4<<1 |1) = 9
-    default:   new_mode = climate::CLIMATE_MODE_AUTO; break;
-  }
+  // Режим — читаем ВЕРХНИЙ полубайт и маппим по таблице «1,3,5,7,9»
+  uint8_t nib = static_cast<uint8_t>((bytes[18] >> 4) & 0x0F);
+  climate::ClimateMode new_mode = decode_mode_from_nibble(nib);
+  ESP_LOGV(TAG, "<< Raw mode nibble=0x%X -> %d", nib, static_cast<int>(new_mode));
   this->mode_ = new_mode;
 
   // Скорость вентилятора (байт 16)
