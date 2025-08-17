@@ -43,6 +43,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   static constexpr uint8_t CMD_WRITE  = 0x65;  // 101
   static constexpr uint8_t CMD_STATUS = 0x66;  // 102
+  static constexpr uint8_t CMD_NAK    = 0xFD;  // наблюдается в логах как "unknown", трактуем как NAK
 
   // Field indices in long write/status frames
   static constexpr int IDX_FAN          = 16;
@@ -73,9 +74,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *pipe_sensor_{nullptr};
 #endif
 
-  // Long WRITE template, total 41 bytes; byte[4] (length) = total-9 = 0x20
+  // Long WRITE template, total 41 bytes; длина (байт[4]) варьируется (см. build_variant_)
   std::vector<uint8_t> tx_bytes_ = {
-      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length (0x20 for 41 bytes)
+      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder
       0x00,0x00,0x01,0x01,      // [5..8]
       0xFE,0x01,0x00,0x00,      // [9..12]
       CMD_WRITE,0x00,0x00,      // [13..15]
@@ -91,12 +92,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x00,                      // [34]
       0x00,                      // [35] quiet/swing report
       0x00,                      // [36] LED
-      0x00,                      // [37] CRC_LO (for WRITE 16-bit)
-      0x00,                      // [38] CRC_HI (for WRITE 16-bit) / 1-byte CRC for short frames
+      0x00,                      // [37] CRC_LO (или 0 при CRC8)
+      0x00,                      // [38] CRC_HI (или CRC8 при 1-байтовой)
       0xF4,0xFB                  // [39..40] tail
   };
 
-  // Short STATUS query (из логов — рабочий)
+  // Short STATUS query (рабочий)
   const std::vector<uint8_t> query_ = {
       0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,
       0xFE,0x01,0x00,0x00, CMD_STATUS, 0x00,0x00,0x00,0x01,
@@ -115,6 +116,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t last_status_ms_{0};
   uint32_t force_poll_at_ms_{0};
 
+  // multi-variant write attempts
+  uint8_t write_attempt_{0};       // 0..N-1
+  static constexpr uint8_t kWriteAttemptsMax = 8;
+
   static constexpr uint32_t kMinGapMs         = 120;
   static constexpr uint32_t kAckTimeoutMs     = 1000;
   static constexpr uint32_t kForcePollDelayMs = 150;
@@ -123,19 +128,26 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void send_query_status_();
   void send_now_();
   void send_write_frame_(const std::vector<uint8_t> &frame);
-  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const;   // 1-byte sum (короткие кадры)
-  void calc_and_patch_crc16_write_(std::vector<uint8_t> &buf) const; // 16-bit sum (WRITE)
+
+  // CRC helpers
+  void calc_and_patch_crc1_(std::vector<uint8_t> &buf, bool len_is_total) const;         // 1-byte sum
+  void calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf, bool len_is_total) const;    // 16-bit sum
+  void calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf, bool len_is_total) const; // CRC16/IBM (Modbus)
+  void calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf, bool len_is_total) const;  // CRC16/CCITT-FALSE
+
+  // Build N-th variant (длина и CRC-схема)
+  void build_variant_(uint8_t attempt, std::vector<uint8_t> &frame);
 
   bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
   void handle_ack_101_();
+  void handle_nak_fd_();
   void parse_status_102_(const std::vector<uint8_t> &frame);
 
   // Encoding helpers
   static uint8_t clamp16_30_(int v) { return v < 16 ? 16 : (v > 30 ? 30 : (uint8_t) v); }
 
-  // «Legacy»-кодирование для WRITE (как в твоих YAML):
-  // mode_hi = ((code<<1)|1) << 4
+  // Legacy-encoding (как в YAML из обсуждения)
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
     uint8_t code = 2; // default cool
     switch (m) {
@@ -149,7 +161,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     return static_cast<uint8_t>(v << 4);
   }
 
-  // tempX = (C<<1) | 1
   static uint8_t encode_target_temp_write_legacy_(uint8_t c) {
     c = clamp16_30_(c);
     return static_cast<uint8_t>((c << 1) | 0x01);
