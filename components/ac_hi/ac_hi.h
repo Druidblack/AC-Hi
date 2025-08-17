@@ -14,8 +14,7 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace esphome {
-namespace ac_hi {
+...
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -66,49 +65,30 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool turbo_{false};
   bool eco_{false};
   bool quiet_{false};
-  bool led_{true};
-  uint8_t sleep_stage_{0};
+  bool led_{false};
+
   bool enable_presets_{true};
 
 #ifdef USE_SENSOR
   sensor::Sensor *pipe_sensor_{nullptr};
 #endif
 
-  // Long WRITE template, total 41 bytes; длина (байт[4]) варьируется (см. build_variant_)
-  std::vector<uint8_t> tx_bytes_ = {
-      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder
-      0x00,0x00,0x01,0x01,      // [5..8]
-      0xFE,0x01,0x00,0x00,      // [9..12]
-      CMD_WRITE,0x00,0x00,      // [13..15]
-      0x23,                      // [16] fan
-      0x45,                      // [17] sleep
-      0x00,                      // [18] mode|power
-      0x00,                      // [19] target temp
-      0x00,                      // [20] air temp (readback)
-      0x00,                      // [21] pipe temp (readback)
-      0x00,0x00,0x00,0x00,0x00,0x00, // [22..27]
-      0x00,0x00,0x00,0x00,0x00, // [28..32]
-      0x00,                      // [33] flags (turbo/eco)
-      0x00,                      // [34]
-      0x00,                      // [35] quiet/swing report
-      0x00,                      // [36] LED
-      0x00,                      // [37] CRC_LO (или 0 при CRC8)
-      0x00,                      // [38] CRC_HI (или CRC8 при 1-байтовой)
-      0xF4,0xFB                  // [39..40] tail
-  };
-
-  // Short STATUS query (рабочий)
-  const std::vector<uint8_t> query_ = {
-      0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,
-      0xFE,0x01,0x00,0x00, CMD_STATUS, 0x00,0x00,0x00,0x01,
-      0xB3, 0xF4,0xFB
-  };
-
-  // RX buffering
+  // Transport state
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
+  std::vector<uint8_t> tx_bytes_{
+    0xF4,0xF5,0x00,0x40,0x20,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00, // header + cmd placeholder
+    0x65,0x00,0x00,0x00,0x00, // cmd and a few bytes (will be overwritten)
+    // ... остальной шаблон, будет заполнен в send_now_()
+    // места под CRC и хвост:
+    // [size-4],[size-3] — CRC (lo,hi); [size-2]=0xF4; [size-1]=0xFB
+  };
+  std::vector<uint8_t> query_{
+    0xF4,0xF5,0x00,0x40,0x11,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,
+    0x00,0x00,0x00,0x00, // ... поля запроса статуса (значения несущественны)
+    0x00,0x00,0xF4,0xFB
+  };
 
-  // Write scheduling / reliability
   bool writing_lock_{false};
   bool dirty_{false};
   uint32_t last_tx_ms_{0};
@@ -124,43 +104,48 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr uint32_t kAckTimeoutMs     = 1000;
   static constexpr uint32_t kForcePollDelayMs = 150;
 
+  // Prefer 'len=TOTAL' first (legacy expects len byte to equal full frame size like 0x29)
+  static constexpr uint8_t kInitialAttempt = 4; // 4: len=total, CRC=SUM16
+
+  // Pending desired snapshot captured at send to allow implicit-ACK via STATUS comparison
+  bool have_pending_{false};
+  bool pending_power_{false};
+  climate::ClimateMode pending_mode_{climate::CLIMATE_MODE_COOL};
+  uint8_t pending_target_c_{24};
+  climate::ClimateFanMode pending_fan_{climate::CLIMATE_FAN_AUTO};
+  climate::ClimateSwingMode pending_swing_{climate::CLIMATE_SWING_OFF};
+  bool pending_turbo_{false};
+  bool pending_eco_{false};
+  bool pending_quiet_{false};
+  bool pending_led_{false};
+
   // Helpers
   void send_query_status_();
-  void send_now_();
   void send_write_frame_(const std::vector<uint8_t> &frame);
+  void send_now_();
 
-  // CRC helpers
-  void calc_and_patch_crc1_(std::vector<uint8_t> &buf, bool len_is_total) const;         // 1-byte sum
-  void calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf, bool len_is_total) const;    // 16-bit sum
-  void calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf, bool len_is_total) const; // CRC16/IBM (Modbus)
-  void calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf, bool len_is_total) const;  // CRC16/CCITT-FALSE
-
-  // Build N-th variant (длина и CRC-схема)
-  void build_variant_(uint8_t attempt, std::vector<uint8_t> &frame);
-
-  bool extract_next_frame_(std::vector<uint8_t> &frame);
+  bool extract_next_frame_(std::vector<uint8_t> &out);
   void handle_frame_(const std::vector<uint8_t> &frame);
+  void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
   void handle_nak_fd_();
-  void parse_status_102_(const std::vector<uint8_t> &frame);
 
-  // Encoding helpers
-  static uint8_t clamp16_30_(int v) { return v < 16 ? 16 : (v > 30 ? 30 : (uint8_t) v); }
+  void build_variant_(uint8_t attempt, std::vector<uint8_t> &frame);
+  void calc_and_patch_crc1_(std::vector<uint8_t> &buf, bool len_is_total) const;
+  void calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf, bool len_is_total) const;
+  void calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf, bool len_is_total) const;
+  void calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf, bool len_is_total) const;
 
-  // Legacy-encoding (как в YAML из обсуждения)
+  static uint8_t clamp16_30_(uint8_t c) { if (c < 16) return 16; if (c > 30) return 30; return c; }
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
-    uint8_t code = 2; // default cool
     switch (m) {
-      case climate::CLIMATE_MODE_FAN_ONLY: code = 0; break;
-      case climate::CLIMATE_MODE_HEAT:     code = 1; break;
-      case climate::CLIMATE_MODE_COOL:     code = 2; break;
-      case climate::CLIMATE_MODE_DRY:      code = 3; break;
-      default:                             code = 2; break;
+      case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
+      case climate::CLIMATE_MODE_HEAT:     return 0x10;
+      case climate::CLIMATE_MODE_COOL:     return 0x20;
+      case climate::CLIMATE_MODE_DRY:      return 0x30;
+      default:                             return 0x20;
     }
-    uint8_t v = static_cast<uint8_t>((code << 1) | 0x01);
-    return static_cast<uint8_t>(v << 4);
   }
-
   static uint8_t encode_target_temp_write_legacy_(uint8_t c) {
     c = clamp16_30_(c);
     return static_cast<uint8_t>((c << 1) | 0x01);
@@ -171,6 +156,16 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static uint8_t encode_sleep_byte_(uint8_t stage);
   static uint8_t encode_swing_ud_(bool on);
   static uint8_t encode_swing_lr_(bool on);
+
+  bool reported_matches_pending_(bool rep_power,
+                                 climate::ClimateMode rep_mode,
+                                 uint8_t rep_set_c,
+                                 climate::ClimateFanMode rep_fan,
+                                 climate::ClimateSwingMode rep_swing,
+                                 bool rep_turbo,
+                                 bool rep_eco,
+                                 bool rep_quiet,
+                                 bool rep_led) const;
 };
 
 } // namespace ac_hi

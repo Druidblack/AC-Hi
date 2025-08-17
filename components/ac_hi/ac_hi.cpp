@@ -14,15 +14,7 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
   switch (f) {
     case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
     case climate::CLIMATE_FAN_QUIET:  code = 10; break;
-    case climate::CLIMATE_FAN_LOW:    code = 12; break;
-    case climate::CLIMATE_FAN_MEDIUM: code = 14; break;
-    case climate::CLIMATE_FAN_HIGH:   code = 16; break;
-    default:                          code = 1;  break;
-  }
-  return static_cast<uint8_t>(code + 1);
-}
-
-uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
+...
   // 0(off),1,2,4,8 then <<1 | 1
   uint8_t code = 0;
   switch (stage) {
@@ -39,6 +31,32 @@ uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
 uint8_t ACHIClimate::encode_swing_ud_(bool on) { return on ? 0b11000000 : 0b01000000; }
 uint8_t ACHIClimate::encode_swing_lr_(bool on) { return on ? 0b00110000 : 0b00010000; }
 
+// Compare reported STATUS with pending desired values.
+// We don't require LED to match to avoid spurious mismatches on models that don't echo it.
+bool ACHIClimate::reported_matches_pending_(bool rep_power,
+                                            climate::ClimateMode rep_mode,
+                                            uint8_t rep_set_c,
+                                            climate::ClimateFanMode rep_fan,
+                                            climate::ClimateSwingMode rep_swing,
+                                            bool rep_turbo,
+                                            bool rep_eco,
+                                            bool rep_quiet,
+                                            bool rep_led) const {
+  if (!this->have_pending_) return false;
+  if (rep_power != this->pending_power_) return false;
+  if (rep_power) { // only check deep fields if powered ON
+    if (rep_mode != this->pending_mode_) return false;
+    if (rep_set_c != this->pending_target_c_) return false;
+    if (rep_fan != this->pending_fan_) return false;
+    if (rep_swing != this->pending_swing_) return false;
+    // Turbo/Eco/Quit may be model-dependent; only enforce when our pending flag is ON
+    if (this->pending_turbo_ && !rep_turbo) return false;
+    if (this->pending_eco_ && !rep_eco) return false;
+    if (this->pending_quiet_ && !rep_quiet) return false;
+  }
+  return true;
+}
+
 // ---------- Traits ----------
 climate::ClimateTraits ACHIClimate::traits() {
   climate::ClimateTraits t;
@@ -53,41 +71,7 @@ climate::ClimateTraits ACHIClimate::traits() {
     climate::CLIMATE_FAN_AUTO,
     climate::CLIMATE_FAN_QUIET,
     climate::CLIMATE_FAN_LOW,
-    climate::CLIMATE_FAN_MEDIUM,
-    climate::CLIMATE_FAN_HIGH,
-  });
-  t.set_supported_swing_modes({
-    climate::CLIMATE_SWING_OFF,
-    climate::CLIMATE_SWING_VERTICAL,
-    climate::CLIMATE_SWING_HORIZONTAL,
-    climate::CLIMATE_SWING_BOTH,
-  });
-  if (enable_presets_) {
-    t.set_supported_presets({
-      climate::CLIMATE_PRESET_NONE,
-      climate::CLIMATE_PRESET_BOOST,
-      climate::CLIMATE_PRESET_ECO,
-      climate::CLIMATE_PRESET_SLEEP
-    });
-  }
-  t.set_visual_min_temperature(16);
-  t.set_visual_max_temperature(30);
-  t.set_visual_temperature_step(1.0f);
-  t.set_supports_current_temperature(true);
-  return t;
-}
-
-// ---------- Control ----------
-void ACHIClimate::control(const climate::ClimateCall &call) {
-  bool changed = false;
-
-  if (call.get_mode().has_value()) {
-    auto m = *call.get_mode();
-    if (m == climate::CLIMATE_MODE_OFF) {
-      if (this->power_on_) { changed = true; }
-      this->power_on_ = false;
-    } else {
-      if (!this->power_on_ || this->mode_ != m) { changed = true; }
+...
       this->power_on_ = true;
       this->mode_ = m;
     }
@@ -118,40 +102,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
-    bool new_turbo = (p == climate::CLIMATE_PRESET_BOOST);
-    bool new_eco   = (p == climate::CLIMATE_PRESET_ECO);
-    uint8_t new_sleep = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
-    if (new_turbo != this->turbo_ || new_eco != this->eco_ || new_sleep != this->sleep_stage_) changed = true;
-    this->turbo_ = new_turbo;
-    this->eco_ = new_eco;
-    this->sleep_stage_ = new_sleep;
-    ESP_LOGD(TAG, "control(): preset turbo=%d eco=%d sleep=%u", (int)this->turbo_, (int)this->eco_, (unsigned)this->sleep_stage_);
-  }
-
-  if (!changed) {
-    ESP_LOGV(TAG, "control(): nothing changed, skipping send");
-    return;
-  }
-
-  this->dirty_ = true;
-
-  if (this->writing_lock_) {
-    ESP_LOGV(TAG, "control(): write in-flight, mark dirty and wait for STATUS/ACK");
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (now - this->last_tx_ms_ < kMinGapMs) {
-    ESP_LOGV(TAG, "control(): respecting min gap (%ums), will send later", (unsigned)kMinGapMs);
-    return;
-  }
-
-  this->send_now_();
-}
-
-// ---------- CRC helpers ----------
-
-// диапазоны зависят от спецификации длины.
+...
 // tail = 2 байта (F4 FB).
 // При длине "total-9": как и раньше: STATUS сработал с суммой [3..size-4] -> 1-байтная в [size-3].
 // Для WRITE перебираем варианты.
@@ -166,17 +117,17 @@ void ACHIClimate::calc_and_patch_crc1_(std::vector<uint8_t> &buf, bool len_is_to
   size_t from = 3;
   size_t to_exclusive = crc_lo_pos; // не включаем CRC байт
   for (size_t i = from; i < to_exclusive; i++) sum = static_cast<uint8_t>(sum + buf[i]);
-  buf[buf.size() - 4] = 0x00;       // заглушка
-  buf[buf.size() - 3] = sum;        // CRC8
+  buf[buf.size() - 4] = 0x00;
+  buf[buf.size() - 3] = sum;
 }
 
 void ACHIClimate::calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf, bool len_is_total) const {
-  // 16-bit SUM; кладём LO,HI в [size-4],[size-3]
+  // 16-битная сумма, LO,HI в хвост.
   if (buf.size() < 10) return;
   uint16_t sum = 0;
   size_t tail = 2;
   size_t crc_bytes = 2;
-  size_t crc_lo_pos = buf.size() - (tail + crc_bytes); // = size-4
+  size_t crc_lo_pos = buf.size() - (tail + crc_bytes);
   size_t from = 3;
   size_t to_exclusive = crc_lo_pos; // не включаем CRC
   for (size_t i = from; i < to_exclusive; i++) sum = static_cast<uint16_t>(sum + buf[i]);
@@ -208,23 +159,7 @@ void ACHIClimate::calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf, bool le
   // CRC16/CCITT-FALSE: poly=0x1021, init=0xFFFF, no refin/out; out big-endian традиционно,
   // но кладём всё равно LO,HI (как в остальных), чтобы не ломать шаблон вставки.
   if (buf.size() < 10) return;
-  uint16_t crc = 0xFFFF;
-  size_t tail = 2;
-  size_t crc_bytes = 2;
-  size_t crc_lo_pos = buf.size() - (tail + crc_bytes);
-  size_t from = 3;
-  size_t to_exclusive = crc_lo_pos;
-  for (size_t i = from; i < to_exclusive; i++) {
-    crc ^= static_cast<uint16_t>(buf[i]) << 8;
-    for (int b = 0; b < 8; b++) {
-      if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-      else crc <<= 1;
-    }
-  }
-  buf[buf.size() - 4] = static_cast<uint8_t>(crc & 0xFF);        // LO
-  buf[buf.size() - 3] = static_cast<uint8_t>((crc >> 8) & 0xFF); // HI
-}
-
+...
 // ---------- Build variant ----------
 void ACHIClimate::build_variant_(uint8_t attempt, std::vector<uint8_t> &frame) {
   // Варианты (0..7):
@@ -310,6 +245,23 @@ void ACHIClimate::send_now_() {
 
   frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
 
+  // Capture pending desired snapshot for implicit ACK via STATUS
+  this->have_pending_   = true;
+  this->pending_power_  = this->power_on_;
+  this->pending_mode_   = this->mode_;
+  this->pending_target_c_ = this->target_c_;
+  this->pending_fan_    = this->fan_;
+  this->pending_swing_  = this->swing_;
+  this->pending_turbo_  = this->turbo_;
+  this->pending_eco_    = this->eco_;
+  this->pending_quiet_  = this->quiet_;
+  this->pending_led_    = this->led_;
+
+  // Prefer starting from legacy-friendly variant (len=TOTAL) on a fresh write
+  if (this->write_attempt_ == 0) {
+    this->write_attempt_ = kInitialAttempt;
+  }
+
   // Номер попытки
   uint8_t attempt = this->write_attempt_;
   this->build_variant_(attempt, frame);
@@ -345,14 +297,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
   const size_t N = rx_.size();
 
   while (i + 1 < N && !(rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1)) ++i;
-  if (i + 1 >= N) { rx_start_ = i; return false; }
-
-  size_t j = i + 2;
-  while (j + 1 < N && !(rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1)) ++j;
-  if (j + 1 >= N) { rx_start_ = i; return false; }
-
-  out.assign(rx_.begin() + (std::ptrdiff_t)i, rx_.begin() + (std::ptrdiff_t)(j + 2));
-  rx_start_ = j + 2;
+...
   return true;
 }
 
@@ -391,7 +336,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (hi == 0x02) m = climate::CLIMATE_MODE_COOL;
   else if (hi == 0x03) m = climate::CLIMATE_MODE_DRY;
   else                 m = this->mode_;
-
   this->mode_ = m;
 
   uint8_t raw_set = b[IDX_TARGET_TEMP];
@@ -432,7 +376,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   this->quiet_ = quiet;
   this->led_   = led;
 
-  bool swing_v = (b[IDX_FLAGS2] & 0b10000000) != 0;
+  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;
   bool swing_h = (b[IDX_FLAGS2] & 0b01000000) != 0;
   climate::ClimateSwingMode swing_mode = climate::CLIMATE_SWING_OFF;
   if (swing_v && swing_h) swing_mode = climate::CLIMATE_SWING_BOTH;
@@ -457,30 +401,25 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            (unsigned)b[IDX_AIR_TEMP], (unsigned)b[IDX_PIPE_TEMP],
            (unsigned)rf, (unsigned)b[IDX_FLAGS], (unsigned)b[IDX_LED]);
 
-  // STATUS == implicit ACK
+  // STATUS: only treat as implicit ACK if it reflects our pending desired state
   if (this->writing_lock_) {
-    ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
-    this->writing_lock_ = false;
-    this->write_attempt_ = 0; // сброс цепочки вариантов
-    const uint32_t now = millis();
-    if (this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
-      this->send_now_();
+    if (this->reported_matches_pending_(power, m, this->target_c_, fan, swing_mode, turbo, eco, quiet, led)) {
+      ESP_LOGV(TAG, "STATUS matches pending command → clearing lock (implicit ACK)");
+      this->writing_lock_ = false;
+      this->write_attempt_ = 0;
+      this->have_pending_ = false;
+    } else {
+      ESP_LOGV(TAG, "STATUS received while waiting ACK but state differs → keep waiting");
     }
   }
 }
 
 void ACHIClimate::handle_ack_101_() {
+  if (!this->writing_lock_) return;
+  ESP_LOGV(TAG, "ACK: clearing lock");
   this->writing_lock_ = false;
   this->write_attempt_ = 0;
-  ESP_LOGV(TAG, "ACK received; dirty=%d", (int)this->dirty_);
-  if (this->dirty_) {
-    const uint32_t now = millis();
-    if (now - this->last_tx_ms_ >= kMinGapMs) {
-      this->send_now_();
-    } else {
-      ESP_LOGV(TAG, "ACK: deferring resend until min gap");
-    }
-  }
+  this->have_pending_ = false;
 }
 
 void ACHIClimate::handle_nak_fd_() {
@@ -511,50 +450,7 @@ void ACHIClimate::loop() {
   while (this->read_byte(&c)) rx_.push_back(c);
 
   if (rx_start_ > 4096) {
-    rx_.erase(rx_.begin(), rx_.begin() + (std::ptrdiff_t)rx_start_);
-    rx_start_ = 0;
-  }
-
-  uint32_t start = millis();
-  std::vector<uint8_t> frame;
-  while (millis() - start < 3) {
-    if (!this->extract_next_frame_(frame)) break;
-    this->handle_frame_(frame);
-  }
-}
-
-void ACHIClimate::update() {
-  const uint32_t now = millis();
-
-  if (this->writing_lock_ && this->force_poll_at_ms_ != 0 && now >= this->force_poll_at_ms_) {
-    this->force_poll_at_ms_ = 0;
-    this->send_query_status_();
-  }
-
-  if (this->writing_lock_ && now > this->ack_deadline_ms_) {
-    // вместо простого сброса — пробуем следующий вариант
-    if (this->write_attempt_ + 1 < kWriteAttemptsMax) {
-      this->writing_lock_ = false;   // освободим, чтобы разрешить send_now_
-      this->write_attempt_++;
-      ESP_LOGW(TAG, "ACK/STATUS timeout after %ums; trying next variant #%u",
-               (unsigned)kAckTimeoutMs, (unsigned)this->write_attempt_);
-      // запустим немедленную отправку
-      if (now - this->last_tx_ms_ >= kMinGapMs) {
-        this->send_now_();
-        return;
-      } else {
-        this->dirty_ = true;
-      }
-    } else {
-      ESP_LOGW(TAG, "ACK/STATUS timeout and all variants tried; clearing lock");
-      this->writing_lock_ = false;
-      this->write_attempt_ = 0;
-    }
-  }
-
-  if (!this->writing_lock_ && this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
-    ESP_LOGV(TAG, "update(): pending dirty state, sending now");
-    this->send_now_();
+...
     return;
   }
 
