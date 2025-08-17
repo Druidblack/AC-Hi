@@ -5,37 +5,322 @@ namespace ac_hi {
 
 static const char *const TAG = "ac_hi";
 
-// ---------- Encoding helpers ----------
+// ---------- Climate boilerplate ----------
+climate::ClimateTraits ACHIClimate::traits() {
+  climate::ClimateTraits t;
+  t.set_supported_modes({
+      climate::CLIMATE_MODE_OFF,
+      climate::CLIMATE_MODE_COOL,
+      climate::CLIMATE_MODE_HEAT,
+      climate::CLIMATE_MODE_DRY,
+      climate::CLIMATE_MODE_FAN_ONLY,
+  });
+  t.set_supported_fan_modes({
+      climate::CLIMATE_FAN_AUTO,
+      climate::CLIMATE_FAN_LOW,
+      climate::CLIMATE_FAN_MEDIUM,
+      climate::CLIMATE_FAN_HIGH,
+  });
+  t.set_supported_swing_modes({
+      climate::CLIMATE_SWING_OFF,
+      climate::CLIMATE_SWING_BOTH,
+  });
+  t.set_visual_min_temperature(16);
+  t.set_visual_max_temperature(30);
+  t.set_visual_temperature_step(1.0f);
+  return t;
+}
+
+void ACHIClimate::control(const climate::ClimateCall &call) {
+  if (call.get_mode().has_value()) {
+    this->mode_ = *call.get_mode();
+    this->power_on_ = (this->mode_ != climate::CLIMATE_MODE_OFF);
+  }
+  if (call.get_target_temperature().has_value())
+    this->target_c_ = static_cast<uint8_t>(std::round(*call.get_target_temperature()));
+
+  if (call.get_fan_mode().has_value())
+    this->fan_ = *call.get_fan_mode();
+
+  if (call.get_swing_mode().has_value())
+    this->swing_ = *call.get_swing_mode();
+
+  this->dirty_ = true;
+  ESP_LOGD(TAG, "control(): mode=%d (power_on=%s)", (int) this->mode_, this->power_on_ ? "YES" : "NO");
+}
+
+void ACHIClimate::update() {
+  // Regular poll every 2s; if we're in write lock poll faster to get STATUS
+  const uint32_t now = millis();
+  if (this->writing_lock_ && now < this->force_poll_at_ms_) {
+    // allow previous poll to elapse
+  }
+  this->send_query_status_();
+}
+
+void ACHIClimate::loop() {
+  // RX accumulation (non-blocking)
+  uint8_t byte;
+  while (this->available()) {
+    if (this->read_byte(&byte)) {
+      this->rx_.push_back(byte);
+    } else {
+      break;
+    }
+  }
+
+  // Extract and handle complete frames
+  std::vector<uint8_t> frame;
+  while (this->extract_next_frame_(frame)) {
+    this->handle_frame_(frame);
+    frame.clear();
+  }
+
+  // Handle pending write/ack
+  const uint32_t now = millis();
+  if (this->dirty_ && !this->writing_lock_) {
+    this->send_now_();
+  }
+
+  if (this->writing_lock_ && now > this->ack_deadline_ms_) {
+    ESP_LOGW(TAG, "ACK timeout: polling status / allowing resend");
+    this->writing_lock_ = false;  // allow resend on next control()
+  }
+}
+
+// ---------- Builders & IO ----------
+
+void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
+  // 50-byte frame template, indexes match legacy YAML (CRC16 SUM at [46]=HI,[47]=LO, tail [48],[49])
+  b.assign(50, 0x00);
+  b[0]  = HI_HDR0; b[1] = HI_HDR1;
+  b[2]  = 0x00;    b[3] = 0x40;
+  b[4]  = 0x29;    // length (legacy template uses 0x29)
+  b[5]  = 0x00;    b[6]  = 0x00; b[7]  = 0x01; b[8]  = 0x01;
+  b[9]  = 0xFE;    b[10] = 0x01; b[11] = 0x00; b[12] = 0x00;
+  b[13] = CMD_WRITE; // 0x65
+  b[14] = 0x00; b[15] = 0x00;
+
+  // Fill dynamic controls
+  b[IDX_FAN]         = encode_fan_byte_(this->fan_);      // same codes as STATUS
+  b[IDX_SLEEP]       = encode_sleep_byte_(this->sleep_stage_);
+  b[IDX_MODE_POWER]  = encode_mode_hi_write_legacy_(this->mode_) | (this->power_on_ ? 0x0C : 0x00);
+  b[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_);
+
+  // Reserved fields 20..31 left zero
+  // Byte 32 - UD swing (0x50 on legacy for on)
+  b[IDX_SWING] = encode_swing_ud_(this->swing_ != climate::CLIMATE_SWING_OFF);
+  // Byte 33 - turbo/eco flags; on legacy Turbo overrides Eco
+  b[IDX_FLAGS] = (this->turbo_ ? 0x0C : 0x00) | (this->eco_ ? 0x10 : 0x00);
+  // Byte 35 - quiet (bit4) + horizontal swing in STATUS; here only quiet
+  b[IDX_FLAGS2] = (this->quiet_ ? 0x10 : 0x00);
+  // Byte 36 MSB - LED
+  b[IDX_LED] = (this->led_ ? 0x40 : 0x00);
+
+  // Trailer & checksums
+  // Place CRC16-SUM (hi,lo) at [46],[47]
+  crc16_sum_legacy_patch(b);
+  b[48] = HI_TAIL0;
+  b[49] = HI_TAIL1;
+
+  // Debug
+  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[46]=0x%02X crc_lo[47]=0x%02X",
+           b[4], b[46], b[47]);
+
+  ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
+           b[IDX_MODE_POWER], (b[IDX_MODE_POWER] & 0xF0), (b[IDX_MODE_POWER] & 0x0F), b[IDX_TARGET_TEMP]);
+}
+
+void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &b) {
+  // Short 21-byte STATUS query used by legacy config with SUM8 checksum
+  b.assign(21, 0x00);
+  b[0]=HI_HDR0; b[1]=HI_HDR1;
+  b[2]=0x00; b[3]=0x40;
+  b[4]=0x0C;             // legacy short len
+  b[5]=0x00; b[6]=0x00; b[7]=0x01; b[8]=0x01;
+  b[9]=0xFE; b[10]=0x01; b[11]=0x00; b[12]=0x00;
+  b[13]=CMD_STATUS;      // 0x66
+  b[14]=0x00; b[15]=0x00; b[16]=0x00;
+  b[17]=0x01;            // ?
+  // [18] checksum (SUM8), [19] tail0, [20] tail1
+  crc8_sum_legacy_patch(b);
+  b[19] = HI_TAIL0;
+  b[20] = HI_TAIL1;
+
+  ESP_LOGV(TAG, "poll: status query sent (len=%d): %02X %02X 00 40 %02X 00 00 01 01 FE 01 00 00 66 00 00 00 01 %02X F4 FB",
+           (int) b.size(), b[0], b[1], b[4], b[18]);
+}
+
+// Compute legacy CRC16-SUM (sum of bytes [2..len-4], store [46]=HI,[47]=LO)
+void ACHIClimate::crc16_sum_legacy_patch(std::vector<uint8_t> &buf) {
+  uint16_t sum = 0;
+  // stop before last 4 bytes (crc+tail)
+  const int stop = (int) buf.size() - 4;
+  for (int i = 2; i < stop; i++) sum += buf[i];
+  buf[46] = (sum >> 8) & 0xFF;
+  buf[47] = sum & 0xFF;
+}
+
+// Compute legacy SUM8 for short STATUS, store at [18]
+void ACHIClimate::crc8_sum_legacy_patch(std::vector<uint8_t> &buf) {
+  uint8_t sum = 0;
+  // stop before last 3 bytes (crc8+tail)
+  const int stop = (int) buf.size() - 3;
+  for (int i = 2; i < stop; i++) sum = (uint8_t)(sum + buf[i]);
+  buf[18] = sum;
+}
+
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // Используем значения, которые видим в STATUS (на практике они же ожидаются в WRITE)
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   return 0x02; // авто — 0x02 (в статусе встречаются 0x01/0x02)
-    case climate::CLIMATE_FAN_QUIET:  return 0x0B;
+    case climate::CLIMATE_FAN_AUTO:   return 0x02;
     case climate::CLIMATE_FAN_LOW:    return 0x0D;
     case climate::CLIMATE_FAN_MEDIUM: return 0x0F;
     case climate::CLIMATE_FAN_HIGH:   return 0x11;
     default:                          return 0x02;
   }
 }
-
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  // 0(off),1,2,4,8 then <<1 | 1
-  uint8_t code = 0;
   switch (stage) {
-    case 0: code = 0; break;
-    case 1: code = 1; break;
-    case 2: code = 2; break;
-    case 3: code = 4; break;
-    case 4: code = 8; break;
-    default: code = 0; break;
+    case 1: return 0x01;
+    case 2: return 0x11;
+    case 3: return 0x21;
+    default: return 0x00;
   }
-  return static_cast<uint8_t>((code << 1) | 0x01);
+}
+uint8_t ACHIClimate::encode_swing_ud_(bool on) { return on ? 0x50 : 0x00; }
+uint8_t ACHIClimate::encode_swing_lr_(bool on) { return on ? 0x50 : 0x00; }
+
+void ACHIClimate::send_now_() {
+  std::vector<uint8_t> frame;
+  this->build_legacy_write_(frame);
+
+  // snapshot desired to allow implicit-ACK
+  this->pending_power_ = this->power_on_;
+  this->pending_mode_  = this->mode_;
+  this->pending_target_c_ = this->target_c_;
+  this->pending_fan_   = this->fan_;
+  this->pending_swing_ = this->swing_;
+  this->pending_turbo_ = this->turbo_;
+  this->pending_eco_   = this->eco_;
+  this->pending_quiet_ = this->quiet_;
+  this->pending_led_   = this->led_;
+  this->have_pending_  = true;
+
+  this->send_write_frame_(frame);
 }
 
-uint8_t ACHIClimate::encode_swing_ud_(bool on) { return on ? 0b11000000 : 0b01000000; }
-uint8_t ACHIClimate::encode_swing_lr_(bool on) { return on ? 0b00110000 : 0b00010000; }
+void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &b) {
+  if (b.size() < 10) return;
 
-// Compare reported STATUS with pending desired values.
+  // Transmit
+  this->write_array(b.data(), b.size());
+  this->flush();                 // ensure TX FIFO emptied
+  delayMicroseconds(2000);       // give RS485 driver time to release bus
+
+  this->last_tx_ms_ = millis();
+  this->ack_deadline_ms_ = this->last_tx_ms_ + 1200; // wait ~1.2s for ACK/STATUS
+  this->writing_lock_ = true;
+
+  // dump hex
+  char dump[512]; size_t pos = 0;
+  for (size_t i = 0; i < b.size() && pos + 3 < sizeof(dump); i++) {
+    pos += snprintf(dump + pos, sizeof(dump) - pos, "%02X%s", b[i], (i + 1 < b.size() ? " " : ""));
+  }
+  ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned) b.size(), dump);
+}
+
+void ACHIClimate::send_query_status_() {
+  // do not spam queries; 900ms gap
+  const uint32_t now = millis();
+  if (now - this->last_status_ms_ < 900) return;
+  this->last_status_ms_ = now;
+
+  std::vector<uint8_t> q;
+  this->build_legacy_query_status_(q);
+  this->write_array(q.data(), q.size());
+  this->flush();
+  delayMicroseconds(1200);
+
+  ESP_LOGV(TAG, "poll: status query sent");
+}
+
+// ---------- RX parsing ----------
+
+bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
+  // find header
+  while (this->rx_start_ + 2 <= this->rx_.size()) {
+    if (this->rx_[this->rx_start_] == HI_HDR0 && this->rx_[this->rx_start_ + 1] == HI_HDR1)
+      break;
+    this->rx_start_++;
+  }
+  if (this->rx_start_ + 2 > this->rx_.size()) {
+    // drop old garbage
+    if (this->rx_start_ > 0) {
+      this->rx_.erase(this->rx_.begin(), this->rx_.begin() + this->rx_start_);
+      this->rx_start_ = 0;
+    }
+    return false;
+  }
+
+  // look for tail
+  size_t i = this->rx_start_ + 2;
+  for (; i + 1 < this->rx_.size(); i++) {
+    if (this->rx_[i] == HI_TAIL0 && this->rx_[i + 1] == HI_TAIL1) {
+      size_t end = i + 2;
+      out.assign(this->rx_.begin() + this->rx_start_, this->rx_.begin() + end);
+      this->rx_.erase(this->rx_.begin(), this->rx_.begin() + end);
+      this->rx_start_ = 0;
+      return true;
+    }
+  }
+
+  // not complete yet, keep buffer trimmed
+  if (this->rx_start_ > 64) {
+    this->rx_.erase(this->rx_.begin(), this->rx_.begin() + this->rx_start_);
+    this->rx_start_ = 0;
+  }
+  return false;
+}
+
+void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
+  if (b.size() < 16) return;
+
+  const uint8_t cmd = b[13];
+
+  if (cmd == CMD_STATUS) {
+    ESP_LOGV(TAG, "RX frame: STATUS (0x66), len=%u", (unsigned) b.size());
+    this->parse_status_102_(b);
+    this->force_poll_at_ms_ = millis() + 1200;
+    return;
+  }
+
+  if (cmd == CMD_WRITE && b.size() == 18) {
+    ESP_LOGV(TAG, "RX frame: ACK (0x65)");
+    this->handle_ack_101_();
+    return;
+  }
+
+  if (cmd == CMD_NAK) {
+    ESP_LOGW(TAG, "RX frame: NAK (0xFD)");
+    this->handle_nak_fd_();
+    return;
+  }
+
+  ESP_LOGV(TAG, "RX frame: cmd=0x%02X len=%u (ignored)", cmd, (unsigned) b.size());
+}
+
+void ACHIClimate::handle_ack_101_() {
+  if (this->writing_lock_) {
+    this->writing_lock_ = false;
+    this->dirty_ = false;
+  }
+}
+
+void ACHIClimate::handle_nak_fd_() {
+  // Allow resend
+  this->writing_lock_ = false;
+}
+
 bool ACHIClimate::reported_matches_pending_(bool rep_power,
                                             climate::ClimateMode rep_mode,
                                             uint8_t rep_set_c,
@@ -44,462 +329,86 @@ bool ACHIClimate::reported_matches_pending_(bool rep_power,
                                             bool rep_turbo,
                                             bool rep_eco,
                                             bool rep_quiet,
-                                            bool /*rep_led*/) const {
+                                            bool rep_led) const {
   if (!this->have_pending_) return false;
-  if (rep_power != this->pending_power_) return false;
-  if (rep_power) { // only check deep fields if powered ON
-    if (rep_mode != this->pending_mode_) return false;
-    if (rep_set_c != this->pending_target_c_) return false;
-    if (rep_fan != this->pending_fan_) return false;
-    if (rep_swing != this->pending_swing_) return false;
-    if (this->pending_turbo_ && !rep_turbo) return false;
-    if (this->pending_eco_ && !rep_eco) return false;
-    if (this->pending_quiet_ && !rep_quiet) return false;
-  }
-  return true;
-}
-
-// ---------- Traits ----------
-climate::ClimateTraits ACHIClimate::traits() {
-  climate::ClimateTraits t;
-  t.set_supported_modes({
-    climate::CLIMATE_MODE_OFF,
-    climate::CLIMATE_MODE_FAN_ONLY,
-    climate::CLIMATE_MODE_HEAT,
-    climate::CLIMATE_MODE_COOL,
-    climate::CLIMATE_MODE_DRY,
-  });
-  t.set_supported_fan_modes({
-    climate::CLIMATE_FAN_AUTO,
-    climate::CLIMATE_FAN_QUIET,
-    climate::CLIMATE_FAN_LOW,
-    climate::CLIMATE_FAN_MEDIUM,
-    climate::CLIMATE_FAN_HIGH,
-  });
-  t.set_supported_swing_modes({
-    climate::CLIMATE_SWING_OFF,
-    climate::CLIMATE_SWING_VERTICAL,
-    climate::CLIMATE_SWING_HORIZONTAL,
-    climate::CLIMATE_SWING_BOTH,
-  });
-  if (enable_presets_) {
-    t.set_supported_presets({
-      climate::CLIMATE_PRESET_NONE,
-      climate::CLIMATE_PRESET_BOOST,
-      climate::CLIMATE_PRESET_ECO,
-      climate::CLIMATE_PRESET_SLEEP,
-    });
-  }
-  t.set_visual_min_temperature(16);
-  t.set_visual_max_temperature(30);
-  t.set_visual_temperature_step(1.0f);
-  return t;
-}
-
-// ---------- Control ----------
-void ACHIClimate::control(const climate::ClimateCall &call) {
-  bool changed = false;
-
-  if (call.get_mode().has_value()) {
-    auto m = *call.get_mode();
-    if (m == climate::CLIMATE_MODE_OFF) {
-      if (this->power_on_) changed = true;
-      this->power_on_ = false;
-    } else {
-      if (!this->power_on_ || this->mode_ != m) changed = true;
-      this->power_on_ = true;
-      this->mode_ = m;
-    }
-    ESP_LOGD(TAG, "control(): mode=%d (power_on=%s)", (int)m, this->power_on_ ? "YES" : "NO");
-  }
-
-  if (call.get_target_temperature().has_value()) {
-    uint8_t c = static_cast<uint8_t>(std::lround(*call.get_target_temperature()));
-    c = clamp16_30_(c);
-    if (c != this->target_c_) changed = true;
-    this->target_c_ = c;
-    ESP_LOGD(TAG, "control(): target_temp=%u", (unsigned)this->target_c_);
-  }
-
-  if (call.get_fan_mode().has_value()) {
-    auto f = *call.get_fan_mode();
-    if (f != this->fan_) changed = true;
-    this->fan_ = f;
-    ESP_LOGD(TAG, "control(): fan=%d", (int)f);
-  }
-
-  if (call.get_swing_mode().has_value()) {
-    auto s = *call.get_swing_mode();
-    if (s != this->swing_) changed = true;
-    this->swing_ = s;
-    ESP_LOGD(TAG, "control(): swing=%d", (int)s);
-  }
-
-  if (call.get_preset().has_value()) {
-    auto p = *call.get_preset();
-    bool new_turbo = (p == climate::CLIMATE_PRESET_BOOST);
-    bool new_eco   = (p == climate::CLIMATE_PRESET_ECO);
-    uint8_t new_sleep = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
-    if (new_turbo != this->turbo_ || new_eco != this->eco_ || new_sleep != this->sleep_stage_) changed = true;
-    this->turbo_ = new_turbo;
-    this->eco_   = new_eco;
-    this->sleep_stage_ = new_sleep;
-  }
-
-  if (changed) this->dirty_ = true;
-}
-
-// ---------- Legacy CRC16-SUM (HI,LO; sum over [2 .. size-4)) ----------
-void ACHIClimate::crc16_sum_legacy_patch(std::vector<uint8_t> &buf) {
-  if (buf.size() < 10) return;
-  uint16_t sum = 0;
-  // Legacy: start from index 2, stop before last 4 bytes (CRC HI, CRC LO, F4, FB)
-  const size_t stop = buf.size() - 4;
-  for (size_t i = 2; i < stop; i++) {
-    sum = static_cast<uint16_t>(sum + buf[i]);
-  }
-  uint8_t hi = static_cast<uint8_t>((sum >> 8) & 0xFF);
-  uint8_t lo = static_cast<uint8_t>(sum & 0xFF);
-  buf[buf.size() - 4] = hi;  // HI first (legacy)
-  buf[buf.size() - 3] = lo;  // LO second
-}
-
-// ---------- Build WRITE (strict legacy layout) ----------
-void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &frame) {
-  // 41 bytes total
-  frame.assign(41, 0x00);
-  // Header
-  frame[0] = HI_HDR0; frame[1] = HI_HDR1;
-  frame[2] = 0x00;
-  frame[3] = 0x40;
-  frame[4] = 0x29;      // length byte (legacy uses 0x29)
-  // Address / fixed part seen in legacy & your logs
-  frame[5] = 0x00; frame[6] = 0x00; frame[7] = 0x01; frame[8] = 0x01;
-  frame[9] = 0xFE; frame[10]= 0x01; frame[11]= 0x00; frame[12]= 0x00;
-  // Command
-  frame[13] = CMD_WRITE;
-
-  // As in legacy dumps: [14]=0x00, [15]=0x00
-  frame[14] = 0x00;
-  frame[15] = 0x00;
-
-  // Payload fields (совпадают с тем, что ты присылал в самом первом TX)
-  frame[IDX_FAN]   = encode_fan_byte_(this->fan_);                         // [16] (AUTO -> 0x02)
-  frame[IDX_SLEEP] = encode_sleep_byte_(this->sleep_stage_);               // [17] (обычно 0x01)
-
-  const uint8_t mode_hi = encode_mode_hi_write_legacy_(this->mode_);
-  const uint8_t power_lo = (this->power_on_ ? 0x0C : 0x04);
-  frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);        // [18]
-
-  frame[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_); // [19]
-
-  // [20..29] zeros on write (legacy ignores)
-  for (int i = 20; i <= 29; i++) frame[i] = 0x00;
-
-  // Reserved area EXACTLY как в первом твоём TX:
-  frame[30] = 0x00;
-  frame[31] = 0x00;
-  frame[32] = 0x50; // НЕ пишем сюда swing — в legacy WRITE тут "магическая" 0x50
-  // [33] — eco/turbo флаги
-  if (this->turbo_)      frame[IDX_FLAGS] = 0b00000010;
-  else if (this->eco_)   frame[IDX_FLAGS] = 0b00000100;
-  else                   frame[IDX_FLAGS] = 0x00;
-  // [34] = 0x00
-  frame[34] = 0x00;
-  // [35] quiet — в legacy WRITE лучше оставить 0x00, quiet достигается выбором FAN_QUIET
-  frame[IDX_FLAGS2] = 0x00;
-  // [36] LED — 0x40 выключено, 0xC0 включено
-  frame[IDX_LED] = this->led_ ? 0xC0 : 0x40;
-
-  // CRC placeholders + tail
-  frame[39] = HI_TAIL0;
-  frame[40] = HI_TAIL1;
-
-  ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
-           frame[IDX_MODE_POWER], mode_hi, power_lo, frame[IDX_TARGET_TEMP]);
-}
-
-// ---------- Build STATUS query (legacy short) ----------
-void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &frame) {
-  // Короткая форма, которая отвечала в старых логах (len=0x11),
-  // критичный байт [17] = 0x01 (seq/маркер)
-  frame.assign(22, 0x00); // 22 bytes total
-  frame[0] = HI_HDR0; frame[1] = HI_HDR1;
-  frame[2] = 0x00;
-  frame[3] = 0x40;
-  frame[4] = 0x11; // длина короткого кадра
-  frame[5] = 0x00; frame[6] = 0x00; frame[7] = 0x01; frame[8] = 0x01;
-  frame[9] = 0xFE; frame[10]= 0x01; frame[11]= 0x00; frame[12]= 0x00;
-  frame[13] = CMD_STATUS;
-  // [14..16] нули
-  frame[14] = 0x00;
-  frame[15] = 0x00;
-  frame[16] = 0x00;
-  // [17] ДОЛЖЕН быть 0x01 — иначе некоторые платы молчат
-  frame[17] = 0x01;
-
-  // CRC placeholders + tail
-  frame[18] = 0x00; // CRC HI placeholder
-  frame[19] = 0x00; // CRC LO placeholder
-  frame[20] = HI_TAIL0;
-  frame[21] = HI_TAIL1;
-
-  crc16_sum_legacy_patch(frame);
-}
-
-// ---------- Transport helpers ----------
-void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &frame) {
-  for (uint8_t b : frame) this->write_byte(b);
-}
-
-void ACHIClimate::send_query_status_() {
-  std::vector<uint8_t> frame;
-  this->build_legacy_query_status_(frame);
-  for (uint8_t b : frame) this->write_byte(b);
-
-  // Отладочный дамп запроса статуса
-  char hexbuf[256]; size_t p = 0;
-  for (size_t i = 0; i < frame.size() && p + 4 < sizeof(hexbuf); i++)
-    p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
-  ESP_LOGV(TAG, "poll: status query sent (len=%u): %s", (unsigned)frame.size(), hexbuf);
-}
-
-// Build snapshot and send
-void ACHIClimate::send_now_() {
-  std::vector<uint8_t> frame;
-  this->build_legacy_write_(frame);
-
-  // Pending snapshot — для implicit ACK через STATUS
-  this->have_pending_   = true;
-  this->pending_power_  = this->power_on_;
-  this->pending_mode_   = this->mode_;
-  this->pending_target_c_ = this->target_c_;
-  this->pending_fan_    = this->fan_;
-  this->pending_swing_  = this->swing_;
-  this->pending_turbo_  = this->turbo_;
-  this->pending_eco_    = this->eco_;
-  this->pending_quiet_  = (this->fan_ == climate::CLIMATE_FAN_QUIET);
-  this->pending_led_    = this->led_;
-
-  // CRC (legacy)
-  crc16_sum_legacy_patch(frame);
-
-  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[%u]=0x%02X crc_lo[%u]=0x%02X",
-           frame[4],
-           (unsigned)(frame.size()-4), frame[frame.size()-4],
-           (unsigned)(frame.size()-3), frame[frame.size()-3]);
-
-  // Dump TX
-  char hexbuf[512]; size_t p = 0;
-  for (size_t i = 0; i < frame.size() && p + 4 < sizeof(hexbuf); i++)
-    p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
-  ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned)frame.size(), hexbuf);
-
-  // Send
-  this->send_write_frame_(frame);
-
-  const uint32_t now = millis();
-  this->last_tx_ms_ = now;
-  this->ack_deadline_ms_ = now + 1000;          // after 1s poll again
-  this->force_poll_at_ms_ = now + 150;          // quick poll to catch STATUS update
-  this->writing_lock_ = true;
-  this->dirty_ = false;
-}
-
-// ---------- RX / parsing ----------
-bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
-  size_t i = rx_start_;
-  const size_t N = rx_.size();
-
-  // find header
-  while (i + 1 < N && !(rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1)) ++i;
-  if (i + 1 >= N) { rx_start_ = i; return false; }
-
-  // find tail from i+2 onwards
-  size_t j = i + 2;
-  while (j + 1 < N && !(rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1)) ++j;
-  if (j + 1 >= N) { rx_start_ = i; return false; }
-
-  // copy frame [i .. j+1]
-  out.assign(rx_.begin() + i, rx_.begin() + j + 2);
-  rx_start_ = j + 2;
-  // truncate buffer periodically
-  if (rx_start_ > 1024) {
-    rx_.erase(rx_.begin(), rx_.begin() + rx_start_);
-    rx_start_ = 0;
-  }
-  return true;
-}
-
-void ACHIClimate::handle_frame_(const std::vector<uint8_t> &frame) {
-  if (frame.size() < 16) return;
-  uint8_t cmd = frame[13];
-  if (cmd == CMD_STATUS) {
-    ESP_LOGV(TAG, "RX frame: STATUS (0x66), len=%u", (unsigned)frame.size());
-    this->parse_status_102_(frame);
-  } else if (cmd == CMD_WRITE) {
-    ESP_LOGV(TAG, "RX frame: ACK (0x65)");
-    this->handle_ack_101_();
-  } else if (cmd == CMD_NAK) {
-    ESP_LOGW(TAG, "RX frame: NAK (0xFD)");
-    this->handle_nak_fd_();
-  } else {
-    ESP_LOGV(TAG, "RX frame: unknown cmd=0x%02X len=%u", cmd, (unsigned)frame.size());
-  }
+  return rep_power == this->pending_power_
+      && rep_mode  == this->pending_mode_
+      && rep_set_c == this->pending_target_c_
+      && rep_fan   == this->pending_fan_
+      && rep_swing == this->pending_swing_
+      && rep_turbo == this->pending_turbo_
+      && rep_eco   == this->pending_eco_
+      && rep_quiet == this->pending_quiet_
+      && rep_led   == this->pending_led_;
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
-  if (b.size() <= (size_t)IDX_LED) return;
+  if (b.size() < 40) return;
 
-  this->last_status_ms_ = millis();
+  const uint8_t mode_lo = b[IDX_MODE_POWER] & 0x0F;
+  const uint8_t mode_hi = b[IDX_MODE_POWER] & 0xF0;
 
-  uint8_t b18 = b[IDX_MODE_POWER];
-  uint8_t lo = (uint8_t)(b18 & 0x0F);
-  uint8_t hi = (uint8_t)((b18 >> 4) & 0x0F);
+  bool power = (mode_lo == 0x0C);
+  climate::ClimateMode mode = climate::CLIMATE_MODE_COOL;
+  switch (mode_hi) {
+    case 0x00: mode = climate::CLIMATE_MODE_FAN_ONLY; break;
+    case 0x10: mode = climate::CLIMATE_MODE_HEAT;     break;
+    case 0x20: mode = climate::CLIMATE_MODE_COOL;     break;
+    case 0x30: mode = climate::CLIMATE_MODE_DRY;      break;
+    default:   mode = climate::CLIMATE_MODE_COOL;     break;
+  }
 
-  bool power = (lo & 0x08) != 0;
-  this->power_on_ = power;
+  uint8_t set_c = (b[IDX_TARGET_TEMP] >> 1) & 0x3F;
+  set_c = clamp16_30_(set_c);
 
-  climate::ClimateMode m;
-  if      (hi == 0x00) m = climate::CLIMATE_MODE_FAN_ONLY;
-  else if (hi == 0x01) m = climate::CLIMATE_MODE_HEAT;
-  else if (hi == 0x02) m = climate::CLIMATE_MODE_COOL;
-  else if (hi == 0x03) m = climate::CLIMATE_MODE_DRY;
-  else                 m = this->mode_;
-  this->mode_ = m;
+  climate::ClimateFanMode fan = climate::CLIMATE_FAN_AUTO;
+  switch (b[IDX_FAN]) {
+    case 0x02: fan = climate::CLIMATE_FAN_AUTO;   break;
+    case 0x0B: fan = climate::CLIMATE_FAN_AUTO;   break; // alias sometimes seen
+    case 0x0D: fan = climate::CLIMATE_FAN_LOW;    break;
+    case 0x0F: fan = climate::CLIMATE_FAN_MEDIUM; break;
+    case 0x11: fan = climate::CLIMATE_FAN_HIGH;   break;
+    default:   fan = climate::CLIMATE_FAN_AUTO;   break;
+  }
 
-  uint8_t raw_set = b[IDX_TARGET_TEMP];
-  uint8_t set_c = (raw_set >= 16 && raw_set <= 30) ? raw_set : (uint8_t)(raw_set >> 1);
-  this->target_c_ = clamp16_30_(set_c);
-  this->target_temperature = this->target_c_;
+  climate::ClimateSwingMode swing = climate::CLIMATE_SWING_OFF;
+  if (b[IDX_SWING] == 0x50 && (b[IDX_FLAGS2] & 0x20))
+    swing = climate::CLIMATE_SWING_BOTH;
+  else if (b[IDX_SWING] == 0x50 || (b[IDX_FLAGS2] & 0x20))
+    swing = climate::CLIMATE_SWING_BOTH;  // treat any as ON
 
-  this->current_temperature = b[IDX_AIR_TEMP];
+  bool turbo = (b[IDX_FLAGS] & 0x0C) == 0x0C;
+  bool eco   = (b[IDX_FLAGS] & 0x10) == 0x10;
+  bool quiet = (b[IDX_FLAGS2] & 0x10) == 0x10;
+  bool led   = (b[IDX_LED] & 0x40) == 0x40;
+
+  const int8_t air   = (int8_t) b[IDX_AIR_TEMP];
+  const int8_t pipe  = (int8_t) b[IDX_PIPE_TEMP];
+
 #ifdef USE_SENSOR
-  if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
+  if (this->pipe_sensor_ != nullptr)
+    this->pipe_sensor_->publish_state(pipe);
 #endif
 
-  uint8_t rf = b[IDX_FAN];
-  climate::ClimateFanMode fan = climate::CLIMATE_FAN_AUTO;
-  if      (rf ==  1 || rf ==  2) fan = climate::CLIMATE_FAN_AUTO;
-  else if (rf == 11)             fan = climate::CLIMATE_FAN_QUIET;
-  else if (rf == 13)             fan = climate::CLIMATE_FAN_LOW;
-  else if (rf == 15)             fan = climate::CLIMATE_FAN_MEDIUM;
-  else if (rf == 17)             fan = climate::CLIMATE_FAN_HIGH;
-  this->fan_ = fan;
-
-  uint8_t rs = b[IDX_SLEEP];
-  uint8_t sc = (uint8_t)(rs >> 1);
-  uint8_t sleep_stage = 0;
-  if      (sc == 0) sleep_stage = 0;
-  else if (sc == 1) sleep_stage = 1;
-  else if (sc == 2) sleep_stage = 2;
-  else if (sc == 4) sleep_stage = 3;
-  else if (sc == 8) sleep_stage = 4;
-  this->sleep_stage_ = sleep_stage;
-
-  bool turbo = (b[IDX_FLAGS]  & 0b00000010) != 0;
-  bool eco   = (b[IDX_FLAGS]  & 0b00000100) != 0;
-  bool quiet = (b[IDX_FLAGS2] & 0b00110000) == 0b00110000;
-  bool led   = (b[IDX_LED]    & 0b10000000) != 0;
-  this->turbo_ = turbo;
-  this->eco_   = eco;
-  this->quiet_ = quiet;
-  this->led_   = led;
-
-  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;         // NB: в WRITE тут 0x50, а в STATUS поле валидное
-  bool swing_h = (b[IDX_FLAGS2] & 0b01000000) != 0;
-  climate::ClimateSwingMode swing_mode = climate::CLIMATE_SWING_OFF;
-  if (swing_v && swing_h) swing_mode = climate::CLIMATE_SWING_BOTH;
-  else if (swing_v)       swing_mode = climate::CLIMATE_SWING_VERTICAL;
-  else if (swing_h)       swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
-  this->swing_ = swing_mode;
-
-  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
-  this->fan_mode = this->fan_;
-  this->swing_mode = this->swing_;
-  if (enable_presets_) {
-    if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-    else this->preset = climate::CLIMATE_PRESET_NONE;
-  }
-
-  this->publish_state();
-
-  ESP_LOGD(TAG, "RX status: b18=0x%02X (hi=0x%X lo=0x%X) set=%u air=%u pipe=%u fan=%u flags=0x%02X led=0x%02X",
-           b18, hi, lo, (unsigned)this->target_c_,
-           (unsigned)b[IDX_AIR_TEMP], (unsigned)b[IDX_PIPE_TEMP],
-           (unsigned)rf, (unsigned)b[IDX_FLAGS], (unsigned)b[IDX_LED]);
-
-  // Treat STATUS as implicit ACK only when it reflects our pending state
-  if (this->writing_lock_) {
-    if (this->reported_matches_pending_(power, m, this->target_c_, fan, swing_mode, turbo, eco, quiet, led)) {
-      ESP_LOGV(TAG, "STATUS matches pending command → clearing lock (implicit ACK)");
-      this->writing_lock_ = false;
-      this->have_pending_ = false;
-    } else {
-      ESP_LOGV(TAG, "STATUS received while waiting ACK but state differs → keep waiting");
-    }
-  }
-}
-
-void ACHIClimate::handle_ack_101_() {
-  if (!this->writing_lock_) return;
-  ESP_LOGV(TAG, "ACK: clearing lock");
-  this->writing_lock_ = false;
-  this->have_pending_ = false;
-}
-
-void ACHIClimate::handle_nak_fd_() {
-  // On true NAK allow resend later
-  this->dirty_ = true;
-  this->writing_lock_ = false;
-}
-
-// ---------- Loop/Update ----------
-void ACHIClimate::loop() {
-  uint8_t c;
-  while (this->read_byte(&c)) rx_.push_back(c);
-
-  // Try to extract frames
-  std::vector<uint8_t> frame;
-  while (this->extract_next_frame_(frame)) {
-    this->handle_frame_(frame);
-  }
-}
-
-void ACHIClimate::update() {
-  const uint32_t now = millis();
-
-  // If a write is pending and we passed ack deadline, poll again and allow a resend
-  if (this->writing_lock_ && now > this->ack_deadline_ms_) {
-    ESP_LOGW(TAG, "ACK timeout: polling status / allowing resend");
-    this->send_query_status_();
+  // Implicit ACK from status if values match what we sent
+  if (this->writing_lock_ && this->reported_matches_pending_(power, mode, set_c, fan, swing, turbo, eco, quiet, led)) {
+    ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
     this->writing_lock_ = false;
-    this->dirty_ = true;  // one more try
+    this->dirty_ = false;
   }
 
-  // If we have changes and not currently waiting, send now (respect gap)
-  if (!this->writing_lock_ && this->dirty_) {
-    if (now - this->last_tx_ms_ >= 120) {
-      this->send_now_();
-    }
-  }
+  // publish actual state
+  this->mode_ = power ? mode : climate::CLIMATE_MODE_OFF;
+  this->power_on_ = power;
+  this->target_c_ = set_c;
+  this->fan_ = fan;
+  this->swing_ = swing;
+  this->turbo_ = turbo;
+  this->eco_ = eco;
+  this->quiet_ = quiet;
+  this->led_ = led;
 
-  // Force a quick poll after we sent a command, to catch implicit-ACK STATUS
-  if (this->writing_lock_ && now >= this->force_poll_at_ms_) {
-    this->send_query_status_();
-    this->force_poll_at_ms_ = now + 1000; // once per second at most until ACK
-  }
-
-  // Regular status polling when idle
-  if (!this->writing_lock_) {
-    if (now - this->last_status_ms_ > 900) {
-      this->send_query_status_();
-    } else {
-      ESP_LOGV(TAG, "poll: skipped (fresh status %ums ago)", (unsigned)(now - this->last_status_ms_));
-    }
-  }
+  climate::Climate::publish_state();
 }
 
 } // namespace ac_hi

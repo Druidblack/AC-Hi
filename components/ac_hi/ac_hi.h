@@ -19,6 +19,11 @@
 namespace esphome {
 namespace ac_hi {
 
+// Hisense/BECO legacy protocol (Ballu-like) over UART/RS485.
+// Frames use header 0xF4 0xF5 and tail 0xF4 0xFB.
+// WRITE frame is 50 bytes in legacy templates (CRC16-SUM placed at [46]=HI,[47]=LO, tail [48],[49]).
+// STATUS query short frame uses SUM8 checksum (single byte) before tail.
+
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
   ACHIClimate() = default;
@@ -54,10 +59,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr int IDX_TARGET_TEMP  = 19;
   static constexpr int IDX_AIR_TEMP     = 20;
   static constexpr int IDX_PIPE_TEMP    = 21;
-  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE тут магическое 0x50
-  static constexpr int IDX_FLAGS        = 33;
-  static constexpr int IDX_FLAGS2       = 35;
-  static constexpr int IDX_LED          = 36;
+  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE тут 0x50
+  static constexpr int IDX_FLAGS        = 33;  // turbo/eco
+  static constexpr int IDX_FLAGS2       = 35;  // quiet + H swing in STATUS
+  static constexpr int IDX_LED          = 36;  // LED bit in MSB
 
   // Desired state
   bool power_on_{false};
@@ -116,8 +121,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void build_legacy_write_(std::vector<uint8_t> &frame);
   void build_legacy_query_status_(std::vector<uint8_t> &frame);
 
-  // Legacy CRC16-SUM: sum over [2 .. size-4) -> write HI, then LO into [size-4],[size-3]
-  static void crc16_sum_legacy_patch(std::vector<uint8_t> &buf);
+  // Checksums
+  static void crc16_sum_legacy_patch(std::vector<uint8_t> &buf); // for WRITE (HI then LO)
+  static void crc8_sum_legacy_patch(std::vector<uint8_t> &buf);  // for short STATUS (single byte)
 
   static uint8_t clamp16_30_(uint8_t c) { if (c < 16) return 16; if (c > 30) return 30; return c; }
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
