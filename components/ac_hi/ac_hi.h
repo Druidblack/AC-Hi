@@ -1,120 +1,148 @@
 #pragma once
 
-#include "esphome/core/component.h"
-#include "esphome/components/uart/uart.h"
 #include "esphome/components/climate/climate.h"
-#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/uart/uart.h"
+#include "esphome/core/component.h"
+#include "esphome/core/hal.h"  // esphome::millis()
+
+// Подключаем заголовок сенсоров только если платформа sensor реально присутствует в билде
+#ifdef USE_SENSOR
+  #include "esphome/components/sensor/sensor.h"
+#endif
+
 #include <vector>
+#include <cstddef>
+#include <cstdint>
+
+namespace esphome {
+namespace sensor {
+class Sensor;  // форвард, если USE_SENSOR не определён
+}  // namespace sensor
+}  // namespace esphome
 
 namespace esphome {
 namespace ac_hi {
 
-// ========================= Protocol constants (legacy) =========================
+// Кадры Hisense:
+// Header: 0xF4 0xF5
+// Tail  : 0xF4 0xFB
+// bytes[4] — «декларированная длина», полный размер кадра = bytes[4] + 9
+static constexpr uint8_t HI_HDR0 = 0xF4;
+static constexpr uint8_t HI_HDR1 = 0xF5;
+static constexpr uint8_t HI_TAIL0 = 0xF4;
+static constexpr uint8_t HI_TAIL1 = 0xFB;
 
-static const uint8_t PFX0 = 0xF4;
-static const uint8_t PFX1 = 0xF5;
-static const uint8_t PFX2 = 0x00;
-static const uint8_t PFX3 = 0x40;
-
-static const uint8_t SUFFIX0 = 0xF4;
-static const uint8_t SUFFIX1 = 0xFB;
-
-static const uint8_t CMD_STATUS = 0x66;
-static const uint8_t CMD_WRITE  = 0x65;
-
-enum : uint8_t {
-  WR_IDX_HDR_0 = 0,
-  WR_IDX_HDR_1 = 1,
-  WR_IDX_HDR_2 = 2,
-  WR_IDX_HDR_3 = 3,
-  WR_IDX_LEN   = 4,
-  WR_IDX_TAG0  = 13,
-  WR_IDX_TAG1  = 14,
-  WR_IDX_TAG2  = 15,
-  WR_IDX_FSET0 = 16,
-  WR_IDX_FSET1 = 17,
-  WR_IDX_MODEP = 18,
-  WR_IDX_SETPT = 19,
-  WR_IDX_CRC_HI = 46,
-  WR_IDX_CRC_LO = 47,
-  WR_IDX_TAIL_0 = 48,
-  WR_IDX_TAIL_1 = 49
-};
-
-enum : uint8_t {
-  ST_IDX_HDR_0 = 0,
-  ST_IDX_HDR_1 = 1,
-  ST_IDX_HDR_2 = 2,
-  ST_IDX_HDR_3 = 3,
-  ST_IDX_LEN   = 4,
-  ST_IDX_TAG0  = 13,
-  ST_IDX_B18   = 18,
-  ST_IDX_B19   = 19,
-};
-
-static const uint8_t B18_MODE_HI_MASK  = 0xF0;
-static const uint8_t B18_POWER_LO_MASK = 0x0F;
-
-static const uint8_t POWER_LO_OFF   = 0x00;
-static const uint8_t POWER_LO_ON_0C = 0x0C;
-static const uint8_t POWER_LO_ON_08 = 0x08;
-
-static const uint8_t MODE_HI_FAN  = 0x00;
-static const uint8_t MODE_HI_HEAT = 0x10;
-static const uint8_t MODE_HI_COOL = 0x20;
-static const uint8_t MODE_HI_DRY  = 0x30;
+// Ограничители, чтобы loop() не блокировал цикл приложения
+static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;    // не более 2 кадров за один проход loop()
+static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;   // и не более 20 мс парсинга за проход
+static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт — compaction
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
-  ACHIClimate() : PollingComponent(1000) {}
+  ACHIClimate() = default;
 
-  void set_pipe_sensor(sensor::Sensor *s) { this->pipe_sensor_ = s; }
+  // Config
+  void set_enable_presets(bool v) { enable_presets_ = v; }
+#ifdef USE_SENSOR
+  void set_pipe_sensor(sensor::Sensor *s) { pipe_sensor_ = s; }
+#else
+  void set_pipe_sensor(void *) {}
+#endif
 
-  // совместимость с твоим main.cpp
-  void set_enable_presets(bool) {}  // no-op
-
-  // Component
   void setup() override;
-  void loop() override {}
+  void loop() override;
   void update() override;
 
-  // Climate
-  climate::ClimateTraits traits() override;
+  // Climate API
   void control(const climate::ClimateCall &call) override;
+  climate::ClimateTraits traits() override;
 
  protected:
-  // Build
-  void build_legacy_write_(std::vector<uint8_t> &frame);
-  void build_status_query_(std::vector<uint8_t> &frame);
+  // ---- Протокол/транспорт ----
+  void send_query_status_();    // короткий запрос состояния (cmd 0x66)
+  void send_write_changes_();   // полная посылка состояния с CRC
+  void calc_and_patch_crc_(std::vector<uint8_t> &buf);
+  bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
 
-  // Send/receive
-  void send_frame_(const std::vector<uint8_t> &frame);
-  bool read_frame_(std::vector<uint8_t> &frame, uint32_t timeout_ms);
-  bool verify_and_classify_(const std::vector<uint8_t> &frame, uint8_t &cmd);
+  // RX фреймер/парсер
+  void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS); // сканер потока с бюджетом
+  bool extract_next_frame_(std::vector<uint8_t> &frame);                       // достаёт [F4 F5 ... F4 FB]
+  void handle_frame_(const std::vector<uint8_t> &frame);
+  void parse_status_102_(const std::vector<uint8_t> &b);
+  void handle_ack_101_();
 
-  // Parse
-  void parse_status_legacy_(const std::vector<uint8_t> &frame);
+  // Буфер входящего потока (скользящее окно: rx_start_ — смещение начала данных)
+  std::vector<uint8_t> rx_;
+  size_t rx_start_{0};
 
-  // Encoding helpers
-  uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode mode) const;
-  uint8_t clamp16_30_(int v) const { if (v < 16) return 16; if (v > 30) return 30; return (uint8_t) v; }
+  bool writing_lock_{false};
+  bool pending_write_{false};
 
-  // CRC helpers (SUM16: hi then lo)
-  uint16_t sum16_(const uint8_t *data, size_t len) const;
+  // Базовый кадр записи (как в YAML initial vector)
+  std::vector<uint8_t> tx_bytes_ = {
+      0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,
+      0x65, 0x00, 0x00, 0x00, // 0..16
+      0x00, // [17] sleep
+      0x00, // [18] power+mode
+      0x00, // [19] set temp (°C, напрямую)
+      0x00, // [20] current temp (RO)
+      0x00, // [21] pipe temp (RO)
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
+      0x00, 0x00, // 30..31
+      0x00, // [32] swing UD/LR
+      0x00, // [33] turbo/eco (tx)
+      0x00, // [34]
+      0x00, // [35] quiet
+      0x00, // [36] LED + misc
+      0x00, // [37]
+      0x00, // [38]
+      0x00, 0x00, 0x00, 0x00, 0x00, // 39..43
+      0x00, 0x00, // 44..45
+      0x00, 0x00, // 46..47 CRC (будут пропатчены)
+      0xF4, 0xFB   // tail
+  };
 
-  // ========================= State =========================
-  uint8_t power_lo_hint_ {POWER_LO_ON_0C};  // 0x08/0x0C в статусе
-  bool status_temp_even_ {false};           // формат b19 в STATUS
+  // Короткий запрос статуса (cmd 0x66) — CRC уже «правильный» для этого шаблона
+  const std::vector<uint8_t> query_ = {
+      0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01, 0x01,
+      0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x01,
+      0xB3, 0xF4, 0xFB
+  };
 
-  // implicit-ACK ожидания
-  uint8_t pending_b18_ {0};
-  uint8_t pending_b19_ {0};
-  bool waiting_ack_ {false};
-  uint32_t last_tx_ms_ {0};
+  // ---- Отражение состояния ----
+  bool power_on_{false};
+  uint8_t target_c_{24}; // 16..30
+  climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
+  climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
+  climate::ClimateSwingMode swing_{climate::CLIMATE_SWING_OFF};
+  bool turbo_{false};
+  bool eco_{false};
+  bool quiet_{false};
+  bool led_{true};
+  uint8_t sleep_stage_{0}; // 0..4
 
-  // сенсоры
-  sensor::Sensor *pipe_sensor_ {nullptr};
-  float last_pipe_c_ {NAN};
+  // Для подавления повторов статуса (по сумме байтов)
+  uint16_t last_status_crc_{0};
+
+  // ---- Кодирование полей ----
+  uint8_t encode_temp_(uint8_t c) {
+    return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
+  }
+  uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
+  uint8_t encode_fan_byte_(climate::ClimateFanMode f);
+  uint8_t encode_sleep_byte_(uint8_t stage);
+  uint8_t encode_swing_ud_(bool on);
+  uint8_t encode_swing_lr_(bool on);
+
+  // Сенсор трубки (опционально)
+#ifdef USE_SENSOR
+  sensor::Sensor *pipe_sensor_{nullptr};
+#else
+  void *pipe_sensor_{nullptr};
+#endif
+
+  // Флаги
+  bool enable_presets_{true};
 };
 
 }  // namespace ac_hi
