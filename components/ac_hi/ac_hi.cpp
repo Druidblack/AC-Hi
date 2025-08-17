@@ -1,6 +1,4 @@
 #include "ac_hi.h"
-#include <algorithm>
-#include <cmath>
 
 namespace esphome {
 namespace ac_hi {
@@ -9,17 +7,15 @@ static const char *const TAG = "ac_hi";
 
 // ---------- Encoding helpers ----------
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16 ; device expects +1 on write
-  uint8_t code = 1;
+  // AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16 ; protocol expects these literal codes
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
-    case climate::CLIMATE_FAN_QUIET:  code = 10; break;
-    case climate::CLIMATE_FAN_LOW:    code = 12; break;
-    case climate::CLIMATE_FAN_MEDIUM: code = 14; break;
-    case climate::CLIMATE_FAN_HIGH:   code = 16; break;
-    default:                          code = 1;  break;
+    case climate::CLIMATE_FAN_AUTO:   return 1;
+    case climate::CLIMATE_FAN_QUIET:  return 10;
+    case climate::CLIMATE_FAN_LOW:    return 12;
+    case climate::CLIMATE_FAN_MEDIUM: return 14;
+    case climate::CLIMATE_FAN_HIGH:   return 16;
+    default:                          return 1;
   }
-  return static_cast<uint8_t>(code + 0); // already encoded value used by protocol
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
@@ -40,7 +36,6 @@ uint8_t ACHIClimate::encode_swing_ud_(bool on) { return on ? 0b11000000 : 0b0100
 uint8_t ACHIClimate::encode_swing_lr_(bool on) { return on ? 0b00110000 : 0b00010000; }
 
 // Compare reported STATUS with pending desired values.
-// We don't require LED to match to avoid spurious mismatches on models that don't echo it.
 bool ACHIClimate::reported_matches_pending_(bool rep_power,
                                             climate::ClimateMode rep_mode,
                                             uint8_t rep_set_c,
@@ -49,7 +44,7 @@ bool ACHIClimate::reported_matches_pending_(bool rep_power,
                                             bool rep_turbo,
                                             bool rep_eco,
                                             bool rep_quiet,
-                                            bool rep_led) const {
+                                            bool /*rep_led*/) const {
   if (!this->have_pending_) return false;
   if (rep_power != this->pending_power_) return false;
   if (rep_power) { // only check deep fields if powered ON
@@ -57,7 +52,6 @@ bool ACHIClimate::reported_matches_pending_(bool rep_power,
     if (rep_set_c != this->pending_target_c_) return false;
     if (rep_fan != this->pending_fan_) return false;
     if (rep_swing != this->pending_swing_) return false;
-    // Turbo/Eco/Quiet may be model-dependent; only enforce when our pending flag is ON
     if (this->pending_turbo_ && !rep_turbo) return false;
     if (this->pending_eco_ && !rep_eco) return false;
     if (this->pending_quiet_ && !rep_quiet) return false;
@@ -143,116 +137,90 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
-    if (p == climate::CLIMATE_PRESET_BOOST) { turbo_ = true; eco_ = false; }
-    else if (p == climate::CLIMATE_PRESET_ECO) { turbo_ = false; eco_ = true; }
-    else { turbo_ = false; eco_ = false; }
-    changed = true;
+    bool new_turbo = (p == climate::CLIMATE_PRESET_BOOST);
+    bool new_eco   = (p == climate::CLIMATE_PRESET_ECO);
+    uint8_t new_sleep = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
+    if (new_turbo != this->turbo_ || new_eco != this->eco_ || new_sleep != this->sleep_stage_) changed = true;
+    this->turbo_ = new_turbo;
+    this->eco_   = new_eco;
+    this->sleep_stage_ = new_sleep;
   }
 
-  if (changed) {
-    this->dirty_ = true;
-  }
+  if (changed) this->dirty_ = true;
 }
 
-// ---------- CRC helpers ----------
-// For all CRC calculations we sum over bytes [3 .. size-4) as observed in logs
-
-void ACHIClimate::calc_and_patch_crc1_(std::vector<uint8_t> &buf) const {
-  if (buf.size() < 8) return;
-  uint8_t sum = 0;
-  size_t crc_lo_pos = buf.size() - 4; // we'll store 0,sum,F4,FB
-  for (size_t i = 3; i < crc_lo_pos; i++) sum = static_cast<uint8_t>(sum + buf[i]);
-  buf[buf.size() - 4] = 0x00;
-  buf[buf.size() - 3] = sum;
-}
-
-void ACHIClimate::calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf) const {
+// ---------- Legacy CRC16-SUM (HI,LO; sum over [2 .. size-4)) ----------
+void ACHIClimate::calc_and_patch_crc16_sum_legacy_(std::vector<uint8_t> &buf) const {
   if (buf.size() < 10) return;
   uint16_t sum = 0;
-  size_t crc_lo_pos = buf.size() - 4;
-  for (size_t i = 3; i < crc_lo_pos; i++) sum = static_cast<uint16_t>(sum + buf[i]);
-  buf[buf.size() - 4] = static_cast<uint8_t>(sum & 0xFF);
-  buf[buf.size() - 3] = static_cast<uint8_t>((sum >> 8) & 0xFF);
+  // Legacy: start from index 2, stop before last 4 bytes (CRC HI, CRC LO, F4, FB)
+  const size_t stop = buf.size() - 4;
+  for (size_t i = 2; i < stop; i++) {
+    sum = static_cast<uint16_t>(sum + buf[i]);
+  }
+  uint8_t hi = static_cast<uint8_t>((sum >> 8) & 0xFF);
+  uint8_t lo = static_cast<uint8_t>(sum & 0xFF);
+  buf[buf.size() - 4] = hi;  // HI first (legacy)
+  buf[buf.size() - 3] = lo;  // LO second
 }
 
-void ACHIClimate::calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf) const {
-  if (buf.size() < 10) return;
-  uint16_t crc = 0xFFFF;
-  size_t crc_lo_pos = buf.size() - 4;
-  for (size_t i = 3; i < crc_lo_pos; i++) {
-    crc ^= static_cast<uint16_t>(buf[i]);
-    for (int b = 0; b < 8; b++) {
-      if (crc & 1) crc = (crc >> 1) ^ 0xA001;
-      else crc >>= 1;
-    }
-  }
-  buf[buf.size() - 4] = static_cast<uint8_t>(crc & 0xFF);        // LO first
-  buf[buf.size() - 3] = static_cast<uint8_t>((crc >> 8) & 0xFF); // HI
-}
+// ---------- Build WRITE (strict legacy layout) ----------
+void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &frame) {
+  // 41 bytes total
+  frame.assign(41, 0x00);
+  // Header
+  frame[0] = HI_HDR0; frame[1] = HI_HDR1;
+  frame[2] = 0x00;
+  frame[3] = 0x40;
+  frame[4] = 0x29;      // length byte (legacy uses 0x29)
+  // Address / fixed part seen in legacy & your logs
+  frame[5] = 0x00; frame[6] = 0x00; frame[7] = 0x01; frame[8] = 0x01;
+  frame[9] = 0xFE; frame[10]= 0x01; frame[11]= 0x00; frame[12]= 0x00;
+  // Command
+  frame[13] = CMD_WRITE;
 
-void ACHIClimate::calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf) const {
-  if (buf.size() < 10) return;
-  uint16_t crc = 0xFFFF;
-  size_t crc_lo_pos = buf.size() - 4;
-  for (size_t i = 3; i < crc_lo_pos; i++) {
-    crc ^= (uint16_t)buf[i] << 8;
-    for (int b = 0; b < 8; b++) {
-      if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-      else crc <<= 1;
-    }
-  }
-  uint16_t out = crc;
-  buf[buf.size() - 4] = static_cast<uint8_t>(out & 0xFF);        // LO
-  buf[buf.size() - 3] = static_cast<uint8_t>((out >> 8) & 0xFF); // HI
-}
+  // Defaults similar to legacy snapshot from your TX:
+  frame[14] = 0x00;
+  frame[15] = 0x00;
 
-// ---------- Build variant ----------
-void ACHIClimate::build_variant_(uint8_t attempt, std::vector<uint8_t> &frame) {
-  // Variants (0..7):
-  // 0: len=total-9, CRC16 SUM
-  // 1: len=total-9, CRC8 SUM
-  // 2: len=total-9, CRC16 MODBUS
-  // 3: len=total-9, CRC16 CCITT
-  // 4: len=total,   CRC16 SUM
-  // 5: len=total,   CRC8 SUM
-  // 6: len=total,   CRC16 MODBUS
-  // 7: len=total,   CRC16 CCITT
-  bool len_is_total = (attempt >= 4);
-  uint8_t len_value = len_is_total ? static_cast<uint8_t>(frame.size()) : static_cast<uint8_t>(frame.size() - 9);
-  frame[4] = len_value;
+  // Payload fields
+  frame[IDX_FAN]   = encode_fan_byte_(this->fan_);                         // [16]
+  frame[IDX_SLEEP] = encode_sleep_byte_(this->sleep_stage_);               // [17]
 
-  // Zero CRC bytes first
-  frame[frame.size() - 4] = 0x00;
-  frame[frame.size() - 3] = 0x00;
+  const uint8_t mode_hi = encode_mode_hi_write_legacy_(this->mode_);
+  const uint8_t power_lo = encode_power_lo_write_(this->power_on_);
+  frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);        // [18]
 
-  uint8_t scheme = attempt % 4;
-  switch (scheme) {
-    case 0:
-      this->calc_and_patch_crc16_sum_(frame);
-      ESP_LOGD(TAG, "build: variant #%u len=0x%02X (mode=%s), CRC=SUM16",
-               attempt, len_value, len_is_total ? "TOTAL" : "TOTAL-9");
-      break;
-    case 1:
-      this->calc_and_patch_crc1_(frame);
-      ESP_LOGD(TAG, "build: variant #%u len=0x%02X (mode=%s), CRC=SUM8",
-               attempt, len_value, len_is_total ? "TOTAL" : "TOTAL-9");
-      break;
-    case 2:
-      this->calc_and_patch_crc16_modbus_(frame);
-      ESP_LOGD(TAG, "build: variant #%u len=0x%02X (mode=%s), CRC=MODBUS",
-               attempt, len_value, len_is_total ? "TOTAL" : "TOTAL-9");
-      break;
-    case 3:
-      this->calc_and_patch_crc16_ccitt_(frame);
-      ESP_LOGD(TAG, "build: variant #%u len=0x%02X (mode=%s), CRC=CCITT",
-               attempt, len_value, len_is_total ? "TOTAL" : "TOTAL-9");
-      break;
-  }
+  frame[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_); // [19]
 
-  // Debug CRC bytes
-  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_lo[%u]=0x%02X crc_hi[%u]=0x%02X",
-           frame[4], (unsigned)(frame.size()-4), frame[frame.size()-4],
-           (unsigned)(frame.size()-3), frame[frame.size()-3]);
+  // Keep [20..29] zeros on write (legacy ignores)
+  // Reserve area [30..36] as in legacy dumps
+  frame[30] = 0x50; frame[31] = 0x00;
+  // Swing
+  const bool v = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
+  const bool h = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
+  frame[IDX_SWING] = static_cast<uint8_t>(encode_swing_ud_(v) | encode_swing_lr_(h)); // [32]
+  // Some boards expect [33] to combine ECO/Turbo
+  if (this->turbo_)      frame[IDX_FLAGS] = 0b00000010;
+  else if (this->eco_)   frame[IDX_FLAGS] = 0b00000100;
+  else                   frame[IDX_FLAGS] = 0x00;
+
+  frame[33] = frame[IDX_FLAGS]; // explicit for readability (same index)
+
+  frame[34] = 0x40; // reserved like in your frames
+  // Quiet via FLAGS2 (bit pattern 0b00110000)
+  this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
+  frame[IDX_FLAGS2] = this->quiet_ ? 0b00110000 : 0x00; // [35]
+  // LED at [36]
+  frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
+
+  // Tail placeholder
+  frame[39] = HI_TAIL0;
+  frame[40] = HI_TAIL1;
+
+  // Debug like in your logs
+  ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
+           frame[IDX_MODE_POWER], mode_hi, power_lo, frame[IDX_TARGET_TEMP]);
 }
 
 // ---------- Transport helpers ----------
@@ -261,45 +229,21 @@ void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &frame) {
 }
 
 void ACHIClimate::send_query_status_() {
-  for (uint8_t b : this->query_) this->write_byte(b);
+  // Short status request (legacy-like). We keep it static; device already responds in your logs.
+  static const uint8_t query[] = {
+    0xF4,0xF5,0x00,0x40,0x11,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,
+    0x00,0x00,0x00,0x01, // payload & CRC placeholder (as in legacy examples)
+    0xB3, // CRC LO/HI here не критично, устройство отвечает — оставляем как было
+    0xF4,0xFB
+  };
+  for (auto b : query) this->write_byte(b);
   ESP_LOGV(TAG, "poll: status query sent");
 }
 
-// Build snapshot and send (with variants)
+// Build snapshot and send (legacy build + legacy CRC16 SUM HI,LO)
 void ACHIClimate::send_now_() {
-  // Prepare base frame of 41 bytes: ensure template size is 41
-  std::vector<uint8_t> frame = this->write_template_;
-  // Ensure tail is present
-  if (frame.size() < 41) frame.resize(41, 0x00);
-  frame[0] = HI_HDR0; frame[1] = HI_HDR1;
-  frame[13] = CMD_WRITE;
-  frame[frame.size()-2] = HI_TAIL0;
-  frame[frame.size()-1] = HI_TAIL1;
-
-  // Fill fields according to mapping
-  // FAN
-  frame[IDX_FAN] = encode_fan_byte_(this->fan_);
-  // SLEEP
-  frame[IDX_SLEEP] = encode_sleep_byte_(this->sleep_stage_);
-  // MODE|POWER
-  uint8_t mode_hi = encode_mode_hi_write_legacy_(this->mode_);
-  uint8_t power_lo = encode_power_lo_write_(this->power_on_);
-  frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);
-  // TARGET
-  frame[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_);
-  // SWING bits
-  bool v = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-  bool h = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-  frame[IDX_SWING] = static_cast<uint8_t>(encode_swing_ud_(v) | encode_swing_lr_(h));
-  // FLAGS
-  if (this->turbo_)      frame[IDX_FLAGS] = 0b00000010;
-  else if (this->eco_)   frame[IDX_FLAGS] = 0b00000100;
-  else                   frame[IDX_FLAGS] = 0x00;
-  // Quiet mapped via FLAGS2
-  this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
-  frame[IDX_FLAGS2] = this->quiet_ ? 0b00110000 : 0x00;
-  // LED
-  frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
+  std::vector<uint8_t> frame;
+  this->build_legacy_write_(frame);
 
   // Capture pending desired snapshot for implicit ACK via STATUS
   this->have_pending_   = true;
@@ -310,25 +254,22 @@ void ACHIClimate::send_now_() {
   this->pending_swing_  = this->swing_;
   this->pending_turbo_  = this->turbo_;
   this->pending_eco_    = this->eco_;
-  this->pending_quiet_  = this->quiet_;
+  this->pending_quiet_  = (this->fan_ == climate::CLIMATE_FAN_QUIET);
   this->pending_led_    = this->led_;
 
-  // Prefer starting from legacy-friendly variant (len=TOTAL) on a fresh write
-  if (this->write_attempt_ == 0) {
-    this->write_attempt_ = kInitialAttempt;
-  }
+  // Legacy CRC
+  this->calc_and_patch_crc16_sum_legacy_(frame);
 
-  uint8_t attempt = this->write_attempt_;
-  this->build_variant_(attempt, frame);
+  // Log CRC bytes like in your output (note: HI at [size-4], LO at [size-3])
+  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[%u]=0x%02X crc_lo[%u]=0x%02X",
+           frame[4],
+           (unsigned)(frame.size()-4), frame[frame.size()-4],
+           (unsigned)(frame.size()-3), frame[frame.size()-3]);
 
-  ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
-           frame[IDX_MODE_POWER], mode_hi, power_lo, frame[IDX_TARGET_TEMP]);
-
-  // Dump frame (limited)
+  // Dump TX
   char hexbuf[512]; size_t p = 0;
-  for (size_t i = 0; i < frame.size() && p + 4 < sizeof(hexbuf); i++) {
+  for (size_t i = 0; i < frame.size() && p + 4 < sizeof(hexbuf); i++)
     p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
-  }
   ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned)frame.size(), hexbuf);
 
   // Send
@@ -336,8 +277,8 @@ void ACHIClimate::send_now_() {
 
   const uint32_t now = millis();
   this->last_tx_ms_ = now;
-  this->ack_deadline_ms_ = now + kAckTimeoutMs;
-  this->force_poll_at_ms_ = now + kForcePollDelayMs;
+  this->ack_deadline_ms_ = now + 1000;          // after 1s poll again
+  this->force_poll_at_ms_ = now + 150;          // quick poll to catch STATUS update
   this->writing_lock_ = true;
   this->dirty_ = false;
 }
@@ -377,7 +318,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &frame) {
     ESP_LOGV(TAG, "RX frame: ACK (0x65)");
     this->handle_ack_101_();
   } else if (cmd == CMD_NAK) {
-    ESP_LOGW(TAG, "RX frame: NAK (0xFD) — will try next variant");
+    ESP_LOGW(TAG, "RX frame: NAK (0xFD)");
     this->handle_nak_fd_();
   } else {
     ESP_LOGV(TAG, "RX frame: unknown cmd=0x%02X len=%u", cmd, (unsigned)frame.size());
@@ -467,12 +408,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            (unsigned)b[IDX_AIR_TEMP], (unsigned)b[IDX_PIPE_TEMP],
            (unsigned)rf, (unsigned)b[IDX_FLAGS], (unsigned)b[IDX_LED]);
 
-  // STATUS: only treat as implicit ACK if it reflects our pending desired state
+  // Treat STATUS as implicit ACK only when it reflects our pending state
   if (this->writing_lock_) {
     if (this->reported_matches_pending_(power, m, this->target_c_, fan, swing_mode, turbo, eco, quiet, led)) {
       ESP_LOGV(TAG, "STATUS matches pending command → clearing lock (implicit ACK)");
       this->writing_lock_ = false;
-      this->write_attempt_ = 0;
       this->have_pending_ = false;
     } else {
       ESP_LOGV(TAG, "STATUS received while waiting ACK but state differs → keep waiting");
@@ -484,29 +424,14 @@ void ACHIClimate::handle_ack_101_() {
   if (!this->writing_lock_) return;
   ESP_LOGV(TAG, "ACK: clearing lock");
   this->writing_lock_ = false;
-  this->write_attempt_ = 0;
   this->have_pending_ = false;
 }
 
 void ACHIClimate::handle_nak_fd_() {
-  // negative ACK — try next variant
-  if (!this->writing_lock_) return;
-  if (this->write_attempt_ + 1 < kWriteAttemptsMax) {
-    this->write_attempt_++;
-    ESP_LOGW(TAG, "NAK: retry with variant #%u", (unsigned)this->write_attempt_);
-    const uint32_t now = millis();
-    if (now - this->last_tx_ms_ >= kMinGapMs) {
-      this->send_now_();
-    } else {
-      // send later in update()
-      this->dirty_ = true;
-      this->writing_lock_ = false;
-    }
-  } else {
-    ESP_LOGE(TAG, "NAK: all variants exhausted; giving up");
-    this->writing_lock_ = false;
-    this->write_attempt_ = 0;
-  }
+  // On true NAK we can try a re-send with the same legacy build after a small delay.
+  // (But in your logs we haven't seen explicit NAKs; only timeouts.)
+  this->dirty_ = true;
+  this->writing_lock_ = false;
 }
 
 // ---------- Loop/Update ----------
@@ -524,20 +449,23 @@ void ACHIClimate::loop() {
 void ACHIClimate::update() {
   const uint32_t now = millis();
 
-  // If a write is pending but we passed ack deadline, retry next variant
+  // If a write is pending and we passed ack deadline, just poll again and allow a one-time resend
   if (this->writing_lock_ && now > this->ack_deadline_ms_) {
-    ESP_LOGW(TAG, "ACK timeout: switching to next write variant");
-    this->handle_nak_fd_();
+    ESP_LOGW(TAG, "ACK timeout: polling status / allowing resend");
+    this->send_query_status_();
+    // allow next update() to resend the same command if user still wants it
+    this->writing_lock_ = false;
+    this->dirty_ = true;  // one more try
   }
 
-  // If we have dirty changes and not currently waiting, send now (respect gap)
+  // If we have changes and not currently waiting, send now (respect gap)
   if (!this->writing_lock_ && this->dirty_) {
-    if (now - this->last_tx_ms_ >= kMinGapMs) {
+    if (now - this->last_tx_ms_ >= 120) {
       this->send_now_();
     }
   }
 
-  // Force a poll a bit after we sent a command, to catch implicit-ACK STATUS
+  // Force a quick poll after we sent a command, to catch implicit-ACK STATUS
   if (this->writing_lock_ && now >= this->force_poll_at_ms_) {
     this->send_query_status_();
     this->force_poll_at_ms_ = now + 1000; // once per second at most until ACK
