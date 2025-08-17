@@ -54,7 +54,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr int IDX_TARGET_TEMP  = 19;
   static constexpr int IDX_AIR_TEMP     = 20;
   static constexpr int IDX_PIPE_TEMP    = 21;
-  static constexpr int IDX_SWING        = 32;
+  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE оставляем 0x50 (см. build)
   static constexpr int IDX_FLAGS        = 33;
   static constexpr int IDX_FLAGS2       = 35;
   static constexpr int IDX_LED          = 36;
@@ -112,8 +112,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_ack_101_();
   void handle_nak_fd_();
 
+  // Legacy builders
   void build_legacy_write_(std::vector<uint8_t> &frame);
-  void calc_and_patch_crc16_sum_legacy_(std::vector<uint8_t> &buf) const;
+  void build_legacy_query_status_(std::vector<uint8_t> &frame);
+
+  // Legacy CRC16-SUM: sum over [2 .. size-4) -> write HI, then LO into [size-4],[size-3]
+  static void crc16_sum_legacy_patch(std::vector<uint8_t> &buf);
 
   static uint8_t clamp16_30_(uint8_t c) { if (c < 16) return 16; if (c > 30) return 30; return c; }
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
@@ -130,7 +134,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     return static_cast<uint8_t>((c << 1) | 0x01);
   }
 
-  static uint8_t encode_power_lo_write_(bool on) { return on ? 0x0C : 0x04; } // write lo-nibble
+  // В WRITE используем те же коды, что видим в STATUS (AUTO=0x02, QUIET=0x0B, LOW=0x0D, MED=0x0F, HIGH=0x11)
   static uint8_t encode_fan_byte_(climate::ClimateFanMode f);
   static uint8_t encode_sleep_byte_(uint8_t stage);
   static uint8_t encode_swing_ud_(bool on);

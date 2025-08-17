@@ -7,14 +7,14 @@ static const char *const TAG = "ac_hi";
 
 // ---------- Encoding helpers ----------
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16 ; protocol expects these literal codes
+  // Используем значения, которые видим в STATUS (на практике они же ожидаются в WRITE)
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   return 1;
-    case climate::CLIMATE_FAN_QUIET:  return 10;
-    case climate::CLIMATE_FAN_LOW:    return 12;
-    case climate::CLIMATE_FAN_MEDIUM: return 14;
-    case climate::CLIMATE_FAN_HIGH:   return 16;
-    default:                          return 1;
+    case climate::CLIMATE_FAN_AUTO:   return 0x02; // авто — 0x02 (в статусе встречаются 0x01/0x02)
+    case climate::CLIMATE_FAN_QUIET:  return 0x0B;
+    case climate::CLIMATE_FAN_LOW:    return 0x0D;
+    case climate::CLIMATE_FAN_MEDIUM: return 0x0F;
+    case climate::CLIMATE_FAN_HIGH:   return 0x11;
+    default:                          return 0x02;
   }
 }
 
@@ -150,7 +150,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 }
 
 // ---------- Legacy CRC16-SUM (HI,LO; sum over [2 .. size-4)) ----------
-void ACHIClimate::calc_and_patch_crc16_sum_legacy_(std::vector<uint8_t> &buf) const {
+void ACHIClimate::crc16_sum_legacy_patch(std::vector<uint8_t> &buf) {
   if (buf.size() < 10) return;
   uint16_t sum = 0;
   // Legacy: start from index 2, stop before last 4 bytes (CRC HI, CRC LO, F4, FB)
@@ -179,48 +179,64 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &frame) {
   // Command
   frame[13] = CMD_WRITE;
 
-  // Defaults similar to legacy snapshot from your TX:
+  // As in legacy dumps: [14]=0x00, [15]=0x00
   frame[14] = 0x00;
   frame[15] = 0x00;
 
-  // Payload fields
-  frame[IDX_FAN]   = encode_fan_byte_(this->fan_);                         // [16]
-  frame[IDX_SLEEP] = encode_sleep_byte_(this->sleep_stage_);               // [17]
+  // Payload fields (совпадают с тем, что ты присылал в самом первом TX)
+  frame[IDX_FAN]   = encode_fan_byte_(this->fan_);                         // [16] (AUTO -> 0x02)
+  frame[IDX_SLEEP] = encode_sleep_byte_(this->sleep_stage_);               // [17] (обычно 0x01)
 
   const uint8_t mode_hi = encode_mode_hi_write_legacy_(this->mode_);
-  const uint8_t power_lo = encode_power_lo_write_(this->power_on_);
+  const uint8_t power_lo = (this->power_on_ ? 0x0C : 0x04);
   frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);        // [18]
 
   frame[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_); // [19]
 
-  // Keep [20..29] zeros on write (legacy ignores)
-  // Reserve area [30..36] as in legacy dumps
-  frame[30] = 0x50; frame[31] = 0x00;
-  // Swing
-  const bool v = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-  const bool h = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-  frame[IDX_SWING] = static_cast<uint8_t>(encode_swing_ud_(v) | encode_swing_lr_(h)); // [32]
-  // Some boards expect [33] to combine ECO/Turbo
+  // [20..29] zeros on write (legacy ignores)
+  for (int i = 20; i <= 29; i++) frame[i] = 0x00;
+
+  // Reserved area EXACTLY as в первом твоём TX:
+  frame[30] = 0x00;
+  frame[31] = 0x00;
+  frame[32] = 0x50; // НЕ пишем сюда swing — в legacy WRITE тут "магическая" 0x50
+  // [33] — eco/turbo флаги
   if (this->turbo_)      frame[IDX_FLAGS] = 0b00000010;
   else if (this->eco_)   frame[IDX_FLAGS] = 0b00000100;
   else                   frame[IDX_FLAGS] = 0x00;
+  // [34] = 0x00
+  frame[34] = 0x00;
+  // [35] quiet — в legacy WRITE лучше оставить 0x00, quiet достигается выбором FAN_QUIET
+  frame[IDX_FLAGS2] = 0x00;
+  // [36] LED — 0x40 выключено, 0xC0 включено
+  frame[IDX_LED] = this->led_ ? 0xC0 : 0x40;
 
-  frame[33] = frame[IDX_FLAGS]; // explicit for readability (same index)
-
-  frame[34] = 0x40; // reserved like in your frames
-  // Quiet via FLAGS2 (bit pattern 0b00110000)
-  this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
-  frame[IDX_FLAGS2] = this->quiet_ ? 0b00110000 : 0x00; // [35]
-  // LED at [36]
-  frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
-
-  // Tail placeholder
+  // CRC placeholders + tail
   frame[39] = HI_TAIL0;
   frame[40] = HI_TAIL1;
 
-  // Debug like in your logs
   ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
            frame[IDX_MODE_POWER], mode_hi, power_lo, frame[IDX_TARGET_TEMP]);
+}
+
+// ---------- Build STATUS query (legacy short) ----------
+void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &frame) {
+  // Типовая короткая форма, которую устройство принимало ранее (len=0x11)
+  frame.assign(22, 0x00); // 22 bytes total
+  frame[0] = HI_HDR0; frame[1] = HI_HDR1;
+  frame[2] = 0x00;
+  frame[3] = 0x40;
+  frame[4] = 0x11; // как в твоих ранних логах
+  frame[5] = 0x00; frame[6] = 0x00; frame[7] = 0x01; frame[8] = 0x01;
+  frame[9] = 0xFE; frame[10]= 0x01; frame[11]= 0x00; frame[12]= 0x00;
+  frame[13] = CMD_STATUS;
+  // [14..17] нули
+  frame[18] = 0x00; // CRC HI placeholder
+  frame[19] = 0x00; // CRC LO placeholder
+  frame[20] = HI_TAIL0;
+  frame[21] = HI_TAIL1;
+
+  crc16_sum_legacy_patch(frame);
 }
 
 // ---------- Transport helpers ----------
@@ -229,23 +245,18 @@ void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &frame) {
 }
 
 void ACHIClimate::send_query_status_() {
-  // Short status request (legacy-like). We keep it static; device already responds in your logs.
-  static const uint8_t query[] = {
-    0xF4,0xF5,0x00,0x40,0x11,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,
-    0x00,0x00,0x00,0x01, // payload & CRC placeholder (as in legacy examples)
-    0xB3, // CRC LO/HI here не критично, устройство отвечает — оставляем как было
-    0xF4,0xFB
-  };
-  for (auto b : query) this->write_byte(b);
+  std::vector<uint8_t> frame;
+  this->build_legacy_query_status_(frame);
+  for (uint8_t b : frame) this->write_byte(b);
   ESP_LOGV(TAG, "poll: status query sent");
 }
 
-// Build snapshot and send (legacy build + legacy CRC16 SUM HI,LO)
+// Build snapshot and send
 void ACHIClimate::send_now_() {
   std::vector<uint8_t> frame;
   this->build_legacy_write_(frame);
 
-  // Capture pending desired snapshot for implicit ACK via STATUS
+  // Pending snapshot — для implicit ACK через STATUS
   this->have_pending_   = true;
   this->pending_power_  = this->power_on_;
   this->pending_mode_   = this->mode_;
@@ -257,10 +268,9 @@ void ACHIClimate::send_now_() {
   this->pending_quiet_  = (this->fan_ == climate::CLIMATE_FAN_QUIET);
   this->pending_led_    = this->led_;
 
-  // Legacy CRC
-  this->calc_and_patch_crc16_sum_legacy_(frame);
+  // CRC (legacy)
+  crc16_sum_legacy_patch(frame);
 
-  // Log CRC bytes like in your output (note: HI at [size-4], LO at [size-3])
   ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[%u]=0x%02X crc_lo[%u]=0x%02X",
            frame[4],
            (unsigned)(frame.size()-4), frame[frame.size()-4],
@@ -383,7 +393,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   this->quiet_ = quiet;
   this->led_   = led;
 
-  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;
+  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;         // NB: в WRITE тут 0x50, но в STATUS поле валидное
   bool swing_h = (b[IDX_FLAGS2] & 0b01000000) != 0;
   climate::ClimateSwingMode swing_mode = climate::CLIMATE_SWING_OFF;
   if (swing_v && swing_h) swing_mode = climate::CLIMATE_SWING_BOTH;
@@ -428,8 +438,7 @@ void ACHIClimate::handle_ack_101_() {
 }
 
 void ACHIClimate::handle_nak_fd_() {
-  // On true NAK we can try a re-send with the same legacy build after a small delay.
-  // (But in your logs we haven't seen explicit NAKs; only timeouts.)
+  // On true NAK allow resend later
   this->dirty_ = true;
   this->writing_lock_ = false;
 }
@@ -449,11 +458,10 @@ void ACHIClimate::loop() {
 void ACHIClimate::update() {
   const uint32_t now = millis();
 
-  // If a write is pending and we passed ack deadline, just poll again and allow a one-time resend
+  // If a write is pending and we passed ack deadline, poll again and allow a resend
   if (this->writing_lock_ && now > this->ack_deadline_ms_) {
     ESP_LOGW(TAG, "ACK timeout: polling status / allowing resend");
     this->send_query_status_();
-    // allow next update() to resend the same command if user still wants it
     this->writing_lock_ = false;
     this->dirty_ = true;  // one more try
   }
