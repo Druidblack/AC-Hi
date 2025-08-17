@@ -174,13 +174,13 @@ void ACHIClimate::send_now_() {
   // [4] length must be total-9 (for 41 bytes -> 0x20)
   frame[4] = static_cast<uint8_t>(frame.size() - 9);
 
-  // [18]: mode|power
-  uint8_t mode_hi = encode_mode_hi_direct_(this->mode_);
+  // [18]: mode|power — ВАЖНО: legacy-кодирование режима в hi-ниббле
+  uint8_t mode_hi = encode_mode_hi_write_legacy_(this->mode_);
   uint8_t power_lo = encode_power_lo_write_(this->power_on_);
   frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);
 
-  // [19]: target temp (plain C)
-  frame[IDX_TARGET_TEMP] = encode_target_temp_direct_(this->target_c_);
+  // [19]: target temp — ВАЖНО: legacy-кодирование (2*C+1)
+  frame[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_);
 
   // [16],[17]: fan / sleep
   frame[IDX_FAN]   = encode_fan_byte_(this->fan_);
@@ -206,9 +206,11 @@ void ACHIClimate::send_now_() {
   // CRC (1 byte, like STATUS)
   this->calc_and_patch_crc1_(frame);
 
-  // Лог: длина и CRC
+  // Лог: длина/CRC и важные поля для write
   ESP_LOGD(TAG, "build: len_byte[4]=0x%02X (expected 0x%02X), crc[38]=0x%02X",
            frame[4], (uint8_t)(frame.size() - 9), frame[38]);
+  ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
+           frame[IDX_MODE_POWER], mode_hi, power_lo, frame[IDX_TARGET_TEMP]);
 
   // Дамп
   char hexbuf[1024];
@@ -271,7 +273,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   uint8_t lo = (uint8_t)(b18 & 0x0F);
   uint8_t hi = (uint8_t)((b18 >> 4) & 0x0F);
 
-  // Питание: по статусу у вас lo==0x0 → OFF
+  // Питание из статуса: у тебя lo==0x0 → OFF
   bool power = (lo & 0x08) != 0;
   this->power_on_ = power;
 

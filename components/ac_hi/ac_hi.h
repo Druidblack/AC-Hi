@@ -75,7 +75,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Long write template, total 41 bytes; byte[4] (length) = total-9 = 0x20
   std::vector<uint8_t> tx_bytes_ = {
-      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder (fixed 0x20 for 41 bytes)
+      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder (0x20 for 41 bytes)
       0x00,0x00,0x01,0x01,      // [5..8]
       0xFE,0x01,0x00,0x00,      // [9..12]
       CMD_WRITE,0x00,0x00,      // [13..15]
@@ -96,7 +96,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0xF4,0xFB                  // [39..40] tail
   };
 
-  // Short status query (known-good from your logs)
+  // Short status query (из твоих логов)
   const std::vector<uint8_t> query_ = {
       0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,
       0xFE,0x01,0x00,0x00, CMD_STATUS, 0x00,0x00,0x00,0x01,
@@ -132,20 +132,29 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Encoding helpers
   static uint8_t clamp16_30_(int v) { return v < 16 ? 16 : (v > 30 ? 30 : (uint8_t) v); }
-  static uint8_t encode_mode_hi_direct_(climate::ClimateMode m) {
-    uint8_t code = 2;
+
+  // «Legacy»-кодирование для WRITE (как в твоих YAML):
+  // mode_hi = ((code<<1)|1) << 4
+  static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
+    uint8_t code = 2; // default cool
     switch (m) {
       case climate::CLIMATE_MODE_FAN_ONLY: code = 0; break;
       case climate::CLIMATE_MODE_HEAT:     code = 1; break;
       case climate::CLIMATE_MODE_COOL:     code = 2; break;
       case climate::CLIMATE_MODE_DRY:      code = 3; break;
-      default: break;
+      default:                             code = 2; break;
     }
-    return (uint8_t)(code << 4);
+    uint8_t v = static_cast<uint8_t>((code << 1) | 0x01);
+    return static_cast<uint8_t>(v << 4);
   }
-  static uint8_t encode_power_lo_write_(bool on) { return on ? 0x0C : 0x04; } // write lo-nibble
-  static uint8_t encode_target_temp_direct_(uint8_t c) { return clamp16_30_(c); }
 
+  // tempX = (C<<1) | 1
+  static uint8_t encode_target_temp_write_legacy_(uint8_t c) {
+    c = clamp16_30_(c);
+    return static_cast<uint8_t>((c << 1) | 0x01);
+  }
+
+  static uint8_t encode_power_lo_write_(bool on) { return on ? 0x0C : 0x04; } // write lo-nibble
   static uint8_t encode_fan_byte_(climate::ClimateFanMode f);
   static uint8_t encode_sleep_byte_(uint8_t stage);
   static uint8_t encode_swing_ud_(bool on);
