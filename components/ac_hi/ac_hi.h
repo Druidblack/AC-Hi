@@ -37,7 +37,6 @@ enum : uint8_t {
   WR_IDX_FSET1 = 17,            // feature/mode set low
   WR_IDX_MODEP = 18,            // b18: mode_hi | power_lo
   WR_IDX_SETPT = 19,            // b19: setpoint encoding
-  // a lot of zeros / options-space ...
   WR_IDX_CRC_HI = 46,
   WR_IDX_CRC_LO = 47,
   WR_IDX_TAIL_0 = 48,           // 0xF4
@@ -51,11 +50,9 @@ enum : uint8_t {
   ST_IDX_HDR_2 = 2,             // 00
   ST_IDX_HDR_3 = 3,             // 40
   ST_IDX_LEN   = 4,             // variable (depends on model)
-  ST_IDX_TAG0  = 13,            // 0x66 or 0x65 (некоторые блоки отвечают 0x65)
-  // payload offsets we read (по логам):
+  ST_IDX_TAG0  = 13,            // 0x66 или 0x65
   ST_IDX_B18   = 18,            // b18: mode_hi|power_lo
   ST_IDX_B19   = 19,            // b19: setpoint
-  // в логах ещё фигурировали b20/b21 и пр., но нам для логики климата достаточно b18/b19
 };
 
 // Mode encoding high nibble in b18
@@ -63,11 +60,11 @@ static const uint8_t B18_MODE_HI_MASK = 0xF0;
 static const uint8_t B18_POWER_LO_MASK = 0x0F;
 
 // Known power low-nibble spellings in the field
-static const uint8_t POWER_LO_OFF = 0x00;
+static const uint8_t POWER_LO_OFF   = 0x00;
 static const uint8_t POWER_LO_ON_0C = 0x0C;  // «классический» вариант
 static const uint8_t POWER_LO_ON_08 = 0x08;  // встречается у ряда блоков (как у тебя)
 
-// High nibble values for modes (по наблюдениям из логов и совместимости)
+// High nibble values for modes
 static const uint8_t MODE_HI_FAN  = 0x00;
 static const uint8_t MODE_HI_HEAT = 0x10;
 static const uint8_t MODE_HI_COOL = 0x20;
@@ -77,11 +74,13 @@ static const uint8_t MODE_HI_DRY  = 0x30;
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
-  // Конструктор с периодом опроса 1 секунда
   ACHIClimate() : PollingComponent(1000) {}
 
   // user config
   void set_pipe_sensor(sensor::Sensor *s) { this->pipe_sensor_ = s; }
+
+  // совместимость с твоим main.cpp
+  void set_enable_presets(bool) {}  // no-op для компиляции с существующим кодом
 
   // Component
   void setup() override;
@@ -93,7 +92,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void control(const climate::ClimateCall &call) override;
 
  protected:
-  // ========================= Protocol helpers =========================
   // Build
   void build_legacy_write_(std::vector<uint8_t> &frame);
   void build_status_query_(std::vector<uint8_t> &frame);
@@ -114,13 +112,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint16_t sum16_(const uint8_t *data, size_t len) const;
 
   // ========================= State =========================
-  // «подсказка» от последнего STATUS: какой low-nibble «нравится» блоку, 0x08 или 0x0C
-  uint8_t power_lo_hint_ {POWER_LO_ON_0C};
+  uint8_t power_lo_hint_ {POWER_LO_ON_0C};  // что прислал блок в STATUS (0x08/0x0C)
+  bool status_temp_even_ {false};           // формат b19 в STATUS: чётный = прямые °C
 
-  // формат уставки в STATUS (если true → b19 уже «прямые °C»; если false → (2*C+1)>>1)
-  bool status_temp_even_ {false};
-
-  // последнее, что отправляли (для implicit-ACK)
+  // для implicit-ACK
   uint8_t pending_b18_ {0};
   uint8_t pending_b19_ {0};
   bool waiting_ack_ {false};
@@ -128,8 +123,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // сенсоры
   sensor::Sensor *pipe_sensor_ {nullptr};
-
-  // кеш по STATUS
   float last_pipe_c_ {NAN};
 };
 
