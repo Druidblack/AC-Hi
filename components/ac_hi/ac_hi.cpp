@@ -22,7 +22,7 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   }
 }
 
-// ВАЖНО: оставляем исходную таблицу кодирования TX nibble (как было у тебя и «работало»):
+// ВАЖНО: оставляем исходную таблицу кодирования TX nibble (как у тебя и «работало»):
 // 0x01=FAN, 0x03=HEAT, 0x05=COOL, 0x07=DRY. (AUTO нет)
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   switch (m) {
@@ -154,6 +154,10 @@ void ACHIClimate::setup() {
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
   this->publish_state();
+  // Чуть мягче тайминги ACK/STATUS (у тебя часто STATUS приходит позднее 1с)
+  this->ack_timeout_ms_ = 1500;
+  this->ack_implicit_window_ms_ = 1400;
+
   ESP_LOGI(TAG, "Setup done. Presets=%s, initial target=%u°C",
            this->enable_presets_ ? "on" : "off", (unsigned)this->target_c_);
 }
@@ -195,7 +199,7 @@ void ACHIClimate::update() {
       ESP_LOGD(TAG, "ENFORCE tick: retry=%u backoff_step=%u next_at=%u ms, desired_fp=0x%08X",
                (unsigned)this->enforce_retry_counter_, (unsigned)this->enforce_backoff_steps_,
                (unsigned)this->next_enforce_tx_at_, (unsigned)this->desired_fp_);
-      // Повторяем ту же команду (tx_bytes_ уже сформирован в control())
+      // Повторяем ту же команду (tx_bytes_ уже сформирован в control(); power-ниббл варьируем в send_write_changes_()).
       this->send_write_changes_();
       uint32_t add = this->enforce_interval_ms_ + static_cast<uint32_t>(this->enforce_backoff_steps_) * 200U;
       this->next_enforce_tx_at_ = now + add;
@@ -317,11 +321,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (need_write) {
     // Сборка TX-кадра
-    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
+    // Низний полубайт питания устанавливается в send_write_changes_, там же перебор вариантов.
+    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // placeholder (по умолчанию как у тебя)
     uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
-    // запись уставки напрямую (протокол записи — 2*T+1; оставляем как было)
+    // запись уставки (протокол записи — 2*T+1; оставляем как было)
     tx_bytes_[19] = encode_temp_(this->target_c_);
 
     tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
@@ -476,6 +481,28 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
 
 void ACHIClimate::send_write_changes_() {
   auto frame = this->tx_bytes_;
+
+  // ---- Варианты «включения питания» в TX[18] при дожиме из HA ----
+  // Идея: часть плат HI ожидают разные комбинации низнего nibble для "ON".
+  // Мы НЕ меняем маппинг, просто пробуем альтернативы, пока статус говорит power=0.
+  if (this->enforce_from_ha_ && this->desired_valid_) {
+    uint8_t old18 = frame[18];
+    uint8_t hi = static_cast<uint8_t>(old18 & 0xF0);
+
+    if (this->desired_.power_on) {
+      static const uint8_t ON_CANDIDATES[] = {0x0C, 0x08, 0x0D}; // базовый и 2 альтернативы
+      // используем номер попытки, чтобы гулять по вариантам
+      uint8_t idx = static_cast<uint8_t>(this->enforce_retry_counter_ % (sizeof(ON_CANDIDATES)));
+      uint8_t lo = ON_CANDIDATES[idx];
+      frame[18] = static_cast<uint8_t>(hi | lo);
+      ESP_LOGW(TAG, "Power-ON nibble variant[%u]=0x%X applied to TX[18] (old=0x%02X new=0x%02X)",
+               (unsigned)idx, (unsigned)lo, (unsigned)old18, (unsigned)frame[18]);
+    } else {
+      // для OFF стабильно 0x04
+      frame[18] = static_cast<uint8_t>(hi | 0x04);
+    }
+  }
+
   this->calc_and_patch_crc_(frame);
   this->log_frame_hex_("TX WRITE hex (0x65)", frame, 64);
   for (auto b : frame) this->write_byte(b);
@@ -602,8 +629,10 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   // Печать «сырых» критичных байтов для быстрой сверки
   if (bytes.size() > 38) {
-    ESP_LOGV(TAG, "STATUS RAW: b16=0x%02X b17=0x%02X b18=0x%02X b19=0x%02X b35=0x%02X b36=0x%02X b37=0x%02X",
-             bytes[16], bytes[17], bytes[18], bytes[19], bytes[35], bytes[36], bytes[37]);
+    uint8_t b18 = bytes[18];
+    ESP_LOGV(TAG, "STATUS RAW: b16=0x%02X b17=0x%02X b18=0x%02X (hi=0x%X lo=0x%X powbit=%u) b19=0x%02X b35=0x%02X b36=0x%02X b37=0x%02X",
+             bytes[16], bytes[17], b18, (unsigned)((b18 >> 4) & 0x0F), (unsigned)(b18 & 0x0F), (unsigned)((b18 & 0x08) ? 1 : 0),
+             bytes[19], bytes[35], bytes[36], bytes[37]);
   }
 
   // Питание/режим/ветер/сон/уставка/темпы
