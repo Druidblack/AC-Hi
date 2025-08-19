@@ -10,6 +10,8 @@ namespace ac_hi {
 static const char *const TAG = "ac_hi.climate";
 
 // ---- Локальные хелперы для (де)кодирования режима ----
+
+// Формат в статусе (byte[18] >> 4): 0x00=FAN, 0x01=HEAT, 0x02=COOL, 0x03=DRY.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
     case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
@@ -20,16 +22,26 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   }
 }
 
-// ВАЖНО: кодируем ровно по той же таблице 0x00..0x03, что и читаем из статуса.
-// Это не изменение маппинга полей, а исправление несоответствия локальной функции
-// собственному же комментарию и факту из логов (STATUS b18 >> 4 == 0..3).
+// ВАЖНО: оставляем исходную таблицу кодирования TX nibble (как было у тебя и «работало»):
+// 0x01=FAN, 0x03=HEAT, 0x05=COOL, 0x07=DRY. (AUTO нет)
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   switch (m) {
-    case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
-    case climate::CLIMATE_MODE_HEAT:     return 0x01;
-    case climate::CLIMATE_MODE_COOL:     return 0x02;
-    case climate::CLIMATE_MODE_DRY:      return 0x03;
-    default:                             return 0x02; // AUTO нет, используем COOL
+    case climate::CLIMATE_MODE_FAN_ONLY: return 0x01;
+    case climate::CLIMATE_MODE_HEAT:     return 0x03;
+    case climate::CLIMATE_MODE_COOL:     return 0x05;
+    case climate::CLIMATE_MODE_DRY:      return 0x07;
+    default:                             return 0x05; // используем COOL
+  }
+}
+
+// Для логов: нормализуем TX nibble в «статусный» вид 0..3, чтобы корректно сравнивать со статусом.
+static inline uint8_t normalize_tx_mode_nibble(uint8_t tx_nib_lo4) {
+  switch (tx_nib_lo4 & 0x0F) {
+    case 0x01: return 0x00; // FAN
+    case 0x03: return 0x01; // HEAT
+    case 0x05: return 0x02; // COOL
+    case 0x07: return 0x03; // DRY
+    default:   return static_cast<uint8_t>(tx_nib_lo4 & 0x0F);
   }
 }
 
@@ -257,6 +269,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
            call.get_fan_mode().has_value(), call.get_swing_mode().has_value(),
            call.get_preset().has_value());
 
+  // Сохраним предыдущий желаемый fp, чтобы понять изменился ли «заказ»
+  uint32_t desired_fp_before = this->desired_fp_;
+
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
@@ -333,14 +348,16 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       tx_bytes_[35] = 0;               // override quiet
     }
 
-    // Доп. диагностический вывод по содержимому TX[18]
+    // Диагностический вывод по содержимому TX[18]
     uint8_t tx18 = tx_bytes_[18];
+    uint8_t tx_mode_nib = static_cast<uint8_t>((tx18 >> 4) & 0x0F);
     ESP_LOGD(TAG, "TX fields: [18]=0x%02X(pwr+mode) [19]=0x%02X(set) [16]=0x%02X(fan) [17]=0x%02X(sleep) [32]=0x%02X(swing) [33]=0x%02X(turbo/eco) [35]=0x%02X(quiet) [36]=0x%02X(LED)",
              tx18, tx_bytes_[19], tx_bytes_[16], tx_bytes_[17], tx_bytes_[32], tx_bytes_[33], tx_bytes_[35], tx_bytes_[36]);
-    ESP_LOGD(TAG, "TX[18] decode check: mode_nibble=0x%X power_bit=%u (low_nibble=0x%X)",
-             (unsigned)(tx18 >> 4), (unsigned)((tx18 & 0x08) ? 1 : 0), (unsigned)(tx18 & 0x0F));
+    ESP_LOGD(TAG, "TX[18] check: mode_tx_nib=0x%X, mode_tx_norm=0x%X, power_bit=%u, low_nibble=0x%X",
+             (unsigned)tx_mode_nib, (unsigned)normalize_tx_mode_nibble(tx_mode_nib),
+             (unsigned)((tx18 & 0x08) ? 1 : 0), (unsigned)(tx18 & 0x0F));
 
-    // === Включаем режим приоритета HA: фиксируем целевое состояние и начинаем дожим ===
+    // === Приоритет HA: фиксируем целевое состояние и начинаем/обновляем дожим ===
     desired_.power_on = this->power_on_;
     desired_.mode = this->mode_;
     desired_.target_c = this->target_c_;
@@ -352,15 +369,20 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     desired_.led = this->led_;
     desired_.sleep_stage = this->sleep_stage_;
     desired_valid_ = true;
+
     desired_fp_ = this->desired_fingerprint_();
+
+    // Если желаемое состояние изменилось — сбрасываем бэк-офф и шлём сразу
+    if (desired_fp_before != desired_fp_) {
+      enforce_backoff_steps_ = 0;
+      enforce_retry_counter_ = 0;
+      next_enforce_tx_at_ = 0; // немедленно
+    }
 
     enforce_from_ha_ = true;
     accept_ir_changes_ = false;
-    next_enforce_tx_at_ = 0;
-    enforce_backoff_steps_ = 0;
-    enforce_retry_counter_ = 0;
 
-    ESP_LOGI(TAG, "ENFORCE start: desired_fp=0x%08X power=%d mode=%d set=%u fan=%d swing=%d turbo=%d eco=%d quiet=%d led=%d sleep=%u",
+    ESP_LOGI(TAG, "ENFORCE start/update: desired_fp=0x%08X power=%d mode=%d set=%u fan=%d swing=%d turbo=%d eco=%d quiet=%d led=%d sleep=%u",
              (unsigned)desired_fp_, desired_.power_on, (int)desired_.mode, (unsigned)desired_.target_c,
              (int)desired_.fan, (int)desired_.swing, desired_.turbo, desired_.eco, desired_.quiet, desired_.led, (unsigned)desired_.sleep_stage);
 
@@ -661,6 +683,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   ESP_LOGD(TAG, "STATUS: power=%d mode=%d fan=%d sleep=%u set=%u room=%u turbo=%d eco=%d quiet=%d led=%d swingUD=%d swingLR=%d",
            this->power_on_, (int)this->mode_, (int)this->fan_, (unsigned)this->sleep_stage_,
            (unsigned)this->target_c_, (unsigned)tair, this->turbo_, this->eco_, this->quiet_, this->led_, updown, leftright);
+
+  // Быстрый дожим питания, если целевое power_on=true, а фактическое = false
+  if (this->enforce_from_ha_ && this->desired_valid_ && this->desired_.power_on && !this->power_on_) {
+    this->next_enforce_tx_at_ = esphome::millis(); // сразу
+  }
 
   // Публикуем фактическое
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
