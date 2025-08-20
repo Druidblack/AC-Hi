@@ -5,7 +5,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"  // esphome::millis()
 
-// Подключаем заголовок сенсоров только если платформа sensor реально присутствует в билде
+// Include sensor header only if the sensor platform is actually present in the build
 #ifdef USE_SENSOR
   #include "esphome/components/sensor/sensor.h"
 #endif
@@ -13,29 +13,30 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace esphome {
 namespace sensor {
-class Sensor;  // форвард, если USE_SENSOR не определён
+class Sensor;  // forward declaration if USE_SENSOR is not defined
 }  // namespace sensor
 }  // namespace esphome
 
 namespace esphome {
 namespace ac_hi {
 
-// Кадры Hisense:
+// Hisense frames:
 // Header: 0xF4 0xF5
 // Tail  : 0xF4 0xFB
-// bytes[4] — «декларированная длина», полный размер кадра = bytes[4] + 9
+// bytes[4] — "declared length", full frame size = bytes[4] + 9
 static constexpr uint8_t HI_HDR0 = 0xF4;
 static constexpr uint8_t HI_HDR1 = 0xF5;
 static constexpr uint8_t HI_TAIL0 = 0xF4;
 static constexpr uint8_t HI_TAIL1 = 0xFB;
 
-// Ограничители, чтобы loop() не блокировал цикл приложения
-static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;    // не более 2 кадров за один проход loop()
-static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;   // и не более 20 мс парсинга за проход
-static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт — compaction
+// Limits to avoid blocking the app loop
+static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;    // at most 2 frames per loop()
+static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;   // and at most 20 ms parsing budget per loop
+static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // compact RX buffer after consuming >512 bytes
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -58,33 +59,33 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   climate::ClimateTraits traits() override;
 
  protected:
-  // ---- Протокол/транспорт ----
-  void send_query_status_();    // короткий запрос состояния (cmd 0x66)
-  void send_write_changes_();   // полная посылка состояния с CRC
+  // ---- Protocol/transport ----
+  void send_query_status_();    // short status request (cmd 0x66)
+  void send_write_changes_();   // full state write with CRC
   void calc_and_patch_crc_(std::vector<uint8_t> &buf);
   bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
 
-  // RX фреймер/парсер
-  void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS); // сканер потока с бюджетом
-  bool extract_next_frame_(std::vector<uint8_t> &frame);                       // достаёт [F4 F5 ... F4 FB]
+  // RX framer/parser
+  void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS); // stream scanner with time budget
+  bool extract_next_frame_(std::vector<uint8_t> &frame);                       // extracts [F4 F5 ... F4 FB]
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
-  // Буфер входящего потока (скользящее окно: rx_start_ — смещение начала данных)
+  // Incoming stream buffer (sliding window: rx_start_ — offset of data start)
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
 
   bool writing_lock_{false};
   bool pending_write_{false};
 
-  // Базовый кадр записи (как в YAML initial vector)
+  // Base write frame (as in YAML initial vector)
   std::vector<uint8_t> tx_bytes_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,
       0x65, 0x00, 0x00, 0x00, // 0..16
       0x00, // [17] sleep
       0x00, // [18] power+mode
-      0x00, // [19] set temp (°C, напрямую)
+      0x00, // [19] set temp (°C, direct)
       0x00, // [20] current temp (RO)
       0x00, // [21] pipe temp (RO)
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
@@ -98,18 +99,18 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x00, // [38]
       0x00, 0x00, 0x00, 0x00, 0x00, // 39..43
       0x00, 0x00, // 44..45
-      0x00, 0x00, // 46..47 CRC (будут пропатчены)
+      0x00, 0x00, // 46..47 CRC (will be patched)
       0xF4, 0xFB   // tail
   };
 
-  // Короткий запрос статуса (cmd 0x66) — CRC уже «правильный» для этого шаблона
+  // Short status query (cmd 0x66) — CRC is already "correct" for this template
   const std::vector<uint8_t> query_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01, 0x01,
       0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x01,
       0xB3, 0xF4, 0xFB
   };
 
-  // ---- Отражение состояния ----
+  // ---- State reflection ----
   bool power_on_{false};
   uint8_t target_c_{24}; // 16..30
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
@@ -121,10 +122,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool led_{true};
   uint8_t sleep_stage_{0}; // 0..4
 
-  // Для подавления повторов статуса (по сумме байтов)
+  // For suppression of repeating statuses (by byte sum)
   uint16_t last_status_crc_{0};
 
-  // ---- Кодирование полей ----
+  // ---- Field encoders ----
   uint8_t encode_temp_(uint8_t c) {
     return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
   }
@@ -134,15 +135,19 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_swing_ud_(bool on);
   uint8_t encode_swing_lr_(bool on);
 
-  // Сенсор трубки (опционально)
+  // Optional pipe sensor
 #ifdef USE_SENSOR
   sensor::Sensor *pipe_sensor_{nullptr};
 #else
   void *pipe_sensor_{nullptr};
 #endif
 
-  // Флаги
+  // Flags
   bool enable_presets_{true};
+
+  // ---- Logging helpers ----
+  std::string bytes_to_hex_(const std::vector<uint8_t> &b) const;       // formats buffer as HEX string
+  void log_frame_(const char *prefix, const std::vector<uint8_t> &b) const; // dumps full frame at VERBOSE level
 };
 
 }  // namespace ac_hi
