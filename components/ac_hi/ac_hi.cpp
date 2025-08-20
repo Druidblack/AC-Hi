@@ -2,7 +2,6 @@
 #include <cmath>
 #include <algorithm>
 #include "esphome/core/helpers.h"  // for format_hex_pretty
-// NOTE: Logging is VERBOSE only and does not change behavior.
 
 namespace esphome {
 namespace ac_hi {
@@ -72,9 +71,10 @@ void ACHIClimate::setup() {
   this->swing_mode = climate::CLIMATE_SWING_OFF;
   this->publish_state();
 
+  // Use internal fields for logs (fan_ / swing_) to avoid optional<...> conversion
   ESP_LOGV(TAG, "Setup complete. presets=%s, init target=%.1f, fan=%s, swing=%s",
            this->enable_presets_ ? "enabled" : "disabled",
-           this->target_temperature, fan_to_str(this->fan_mode), swing_to_str(this->swing_mode));
+           this->target_temperature, fan_to_str(this->fan_), swing_to_str(this->swing_));
 }
 
 void ACHIClimate::update() {
@@ -252,8 +252,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
+
+  // Use internal fields for logging to avoid optional conversions
   ESP_LOGV(TAG, "State published (optimistic). mode=%s, target=%.1f, fan=%s, swing=%s",
-           mode_to_str(this->mode), this->target_temperature, fan_to_str(this->fan_mode), swing_to_str(this->swing_mode));
+           mode_to_str(this->mode), this->target_temperature, fan_to_str(this->fan_), swing_to_str(this->swing_));
 }
 
 // ---- Кодирование полей ----
@@ -405,7 +407,6 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
                    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
                    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total));
       rx_start_ += expected_total;
-      // Do not log here to avoid double logging; we log after extraction in try_parse...
       return true;
     }
   }
