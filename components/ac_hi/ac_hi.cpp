@@ -12,7 +12,7 @@ namespace ac_hi {
 static const char *const TAG = "ac_hi";
 
 // ---- Local helpers for (de)encoding mode ----
-// Target nibble layout (byte[18] >> 4):
+// Target nibble layout (byte[18] >> 4) on RX:
 // 0x00 = FAN_ONLY, 0x01 = HEAT, 0x02 = COOL, 0x03 = DRY.
 // There's no AUTO here — it's not supported and not exposed to HA.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
@@ -25,6 +25,7 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   }
 }
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
+  // TX uses odd nibble codes (protocol quirk). Do not change mapping.
   switch (m) {
     case climate::CLIMATE_MODE_FAN_ONLY: return 0x01;
     case climate::CLIMATE_MODE_HEAT:     return 0x03;
@@ -35,10 +36,28 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
 }
 
 void ACHIClimate::setup() {
+  // Initialize default HA visible state
   this->mode = climate::CLIMATE_MODE_OFF;
   this->target_temperature = 24;
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
+
+  // Initialize desired_* to match current defaults, so signatures start aligned
+  d_power_on_     = false;
+  d_mode_         = climate::CLIMATE_MODE_OFF;
+  d_target_c_     = 24;
+  d_fan_          = climate::CLIMATE_FAN_AUTO;
+  d_swing_        = climate::CLIMATE_SWING_OFF;
+  d_turbo_        = false;
+  d_eco_          = false;
+  d_quiet_        = false;
+  d_led_          = true;
+  d_sleep_stage_  = 0;
+
+  // Ensure actual state default is consistent with class member defaults
+  recalc_desired_sig_();
+  recalc_actual_sig_();
+
   this->publish_state();
   ESP_LOGV(TAG, "Setup completed: defaults published (mode=OFF, target=24°C, fan=AUTO, swing=OFF)");
 }
@@ -114,17 +133,19 @@ climate::ClimateTraits ACHIClimate::traits() {
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool need_write = false;
 
+  // --- Update desired_* only (HA has top priority) ---
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
-      this->power_on_ = false;
+      d_power_on_ = false;
+      d_mode_ = climate::CLIMATE_MODE_COOL; // internal default; OFF handled by d_power_on_
     } else {
-      this->power_on_ = true;
-      this->mode_ = m;
+      d_power_on_ = true;
+      d_mode_ = m;
     }
     need_write = true;
     ESP_LOGV(TAG, "Control: requested mode=%s (power_on=%s)",
-             climate::climate_mode_to_string(m), this->power_on_ ? "true" : "false");
+             climate::climate_mode_to_string(m), d_power_on_ ? "true" : "false");
   }
 
   if (call.get_target_temperature().has_value()) {
@@ -132,94 +153,75 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     if (!std::isnan(t)) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
-      this->target_c_ = c;
+      d_target_c_ = c;
       need_write = true;
       ESP_LOGV(TAG, "Control: requested target temperature=%.1f°C -> clipped=%u°C", t, (unsigned) c);
     }
   }
 
   if (call.get_fan_mode().has_value()) {
-    this->fan_ = *call.get_fan_mode();
+    d_fan_ = *call.get_fan_mode();
     need_write = true;
-    ESP_LOGV(TAG, "Control: requested fan=%s", climate::climate_fan_mode_to_string(this->fan_));
+    ESP_LOGV(TAG, "Control: requested fan=%s", climate::climate_fan_mode_to_string(d_fan_));
   }
 
   if (call.get_swing_mode().has_value()) {
-    this->swing_ = *call.get_swing_mode();
+    d_swing_ = *call.get_swing_mode();
     need_write = true;
-    ESP_LOGV(TAG, "Control: requested swing=%s", climate::climate_swing_mode_to_string(this->swing_));
+    ESP_LOGV(TAG, "Control: requested swing=%s", climate::climate_swing_mode_to_string(d_swing_));
   }
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
-    this->eco_ = (p == climate::CLIMATE_PRESET_ECO);
-    this->turbo_ = (p == climate::CLIMATE_PRESET_BOOST);
-    this->sleep_stage_ = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
+    d_eco_ = (p == climate::CLIMATE_PRESET_ECO);
+    d_turbo_ = (p == climate::CLIMATE_PRESET_BOOST);
+    d_sleep_stage_ = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
     need_write = true;
     ESP_LOGV(TAG, "Control: requested preset=%s -> flags{eco=%s,turbo=%s,sleep_stage=%u}",
              climate::climate_preset_to_string(p),
-             this->eco_ ? "true" : "false",
-             this->turbo_ ? "true" : "false",
-             (unsigned) this->sleep_stage_);
+             d_eco_ ? "true" : "false",
+             d_turbo_ ? "true" : "false",
+             (unsigned) d_sleep_stage_);
   }
 
+  // Quiet follows fan=QUIET (desired side)
+  d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
+
   if (need_write) {
-    // Build TX frame (no functional mapping changes)
-    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
-    uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
-    tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
+    // As soon as HA issues a change, block remote changes and enforce target
+    accept_remote_changes_ = false;
+    ha_priority_active_ = true;
 
-    // write setpoint directly (protocol requirement for this field)
-    tx_bytes_[19] = encode_temp_(this->target_c_);
-
-    tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
-    tx_bytes_[17] = encode_sleep_byte_(this->sleep_stage_); // sleep
-
-    bool v_swing = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-    bool h_swing = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-    uint8_t updown_bin = encode_swing_ud_(v_swing);
-    uint8_t leftright_bin = encode_swing_lr_(h_swing);
-    tx_bytes_[32] = static_cast<uint8_t>(updown_bin + leftright_bin);
-
-    uint8_t turbo_bin = this->turbo_ ? 0b00001100 : 0b00000100;
-    uint8_t eco_bin = this->eco_ ? 0b00110000 : 0b00000000;
-    tx_bytes_[33] = (this->turbo_ ? turbo_bin : (eco_bin ? eco_bin : 0));
-
-    this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
-    tx_bytes_[35] = this->quiet_ ? 0b00110000 : 0b00000000;
-
-    tx_bytes_[36] = this->led_ ? 0b11000000 : 0b01000000;
-
-    if (this->turbo_) {
-      tx_bytes_[19] = this->target_c_; // turbo: do not alter setpoint
-      tx_bytes_[33] = turbo_bin;
-      tx_bytes_[35] = 0;               // override quiet
-    }
+    // Build TX frame from desired_* (no mapping changes)
+    build_tx_from_desired_();
 
     this->writing_lock_ = true;
     this->pending_write_ = true;
-    ESP_LOGV(TAG, "Control: issuing WRITE (lock=true, pending=true). mode=%s, target=%u°C, fan=%s, swing=%s, flags{eco=%s,turbo=%s,quiet=%s,led=%s}",
-             climate::climate_mode_to_string(this->mode_),
-             (unsigned) this->target_c_,
-             climate::climate_fan_mode_to_string(this->fan_),
-             climate::climate_swing_mode_to_string(this->swing_),
-             this->eco_ ? "true" : "false",
-             this->turbo_ ? "true" : "false",
-             this->quiet_ ? "true" : "false",
-             this->led_ ? "true" : "false");
+
+    recalc_desired_sig_();
+
+    ESP_LOGV(TAG, "Control: issuing WRITE (lock=true, pending=true). DESIRED: mode=%s, target=%u°C, fan=%s, swing=%s, flags{eco=%s,turbo=%s,quiet=%s,led=%s}",
+             climate::climate_mode_to_string(d_mode_),
+             (unsigned) d_target_c_,
+             climate::climate_fan_mode_to_string(d_fan_),
+             climate::climate_swing_mode_to_string(d_swing_),
+             d_eco_ ? "true" : "false",
+             d_turbo_ ? "true" : "false",
+             d_quiet_ ? "true" : "false",
+             d_led_ ? "true" : "false");
 
     this->send_write_changes_();
   }
 
-  // Optimistic publish of the expected state
-  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
-  this->target_temperature = this->target_c_;
-  this->fan_mode = this->fan_;
-  this->swing_mode = this->swing_;
+  // Publish HA-visible state optimistically to desired
+  this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
+  this->target_temperature = d_target_c_;
+  this->fan_mode = d_fan_;
+  this->swing_mode = d_swing_;
   if (enable_presets_) {
-    if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
+    if (d_turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
+    else if (d_eco_) this->preset = climate::CLIMATE_PRESET_ECO;
+    else if (d_sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
@@ -228,7 +230,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 // ---- Field encoding (no mapping changes) ----
 
 uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // Build high nibble: (nibble {0..3}) << 4
+  // Build high nibble: (nibble {1,3,5,7}) << 4 (TX encoding)
   return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
 }
 
@@ -307,6 +309,9 @@ void ACHIClimate::send_write_changes_() {
   this->log_frame_("TX", frame);
   for (auto b : frame) this->write_byte(b);
   this->flush();
+
+  // Keep a copy of the last exact TX frame sent for analysis
+  last_tx_frame_ = std::move(frame);
 }
 
 // ---- RX scanner/parser ----
@@ -423,6 +428,11 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
+  // Store the raw frame for diagnostics
+  last_status_frame_ = bytes;
+
+  // ---- Parse actual device state (do not change mappings) ----
+
   // Power (byte 18, bit 3)
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
@@ -451,7 +461,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (code == 8) this->sleep_stage_ = 4;
   else this->sleep_stage_ = 0;
 
-  // Target temperature (byte 19) — value in °C directly
+  // Target temperature (byte 19) — value in °C directly on RX
   uint8_t raw_set = bytes[19];
   if (raw_set >= 16 && raw_set <= 30) this->target_c_ = raw_set;
   this->target_temperature = this->target_c_;
@@ -480,17 +490,13 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (leftright) this->swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else this->swing_ = climate::CLIMATE_SWING_OFF;
 
-  // Publish the parsed state
-  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
-  this->fan_mode = this->fan_;
-  this->swing_mode = this->swing_;
-  if (enable_presets_) {
-    if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-    else this->preset = climate::CLIMATE_PRESET_NONE;
-  }
-  this->publish_state();
+  // Recalculate actual control signature after parsing
+  recalc_actual_sig_();
+
+  // Publish HA-visible state with gating:
+  // - If accept_remote_changes_ == true -> publish ACTUAL (remote changes allowed)
+  // - If accept_remote_changes_ == false -> publish DESIRED (but sensors updated)
+  publish_gated_state_();
 
   ESP_LOGV(TAG,
            "Parsed STATUS: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%u°C, sleep_stage=%u, flags{eco=%s,turbo=%s,quiet=%s,led=%s}",
@@ -505,12 +511,139 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
            this->turbo_ ? "true" : "false",
            this->quiet_ ? "true" : "false",
            this->led_ ? "true" : "false");
+
+  // If HA has priority, keep enforcing desired until signatures match
+  maybe_force_to_target_();
 }
 
 void ACHIClimate::handle_ack_101_() {
   this->writing_lock_ = false;
   this->pending_write_ = false;
   ESP_LOGV(TAG, "ACK(0x65): write acknowledged (lock=false, pending=false)");
+}
+
+// ---- Priority/authority helpers ----
+
+void ACHIClimate::build_tx_from_desired_() {
+  // Build TX frame from desired_* fields; keep protocol mapping identical
+  uint8_t power_bin = d_power_on_ ? 0b00001100 : 0b00000100;  // low nibble
+  uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(d_mode_) << 4);
+  tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
+
+  // setpoint (protocol requires encoded form on TX)
+  tx_bytes_[19] = encode_temp_(d_target_c_);
+
+  tx_bytes_[16] = encode_fan_byte_(d_fan_);             // fan
+  tx_bytes_[17] = encode_sleep_byte_(d_sleep_stage_);   // sleep
+
+  const bool v_swing = (d_swing_ == climate::CLIMATE_SWING_VERTICAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
+  const bool h_swing = (d_swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
+  const uint8_t updown_bin = encode_swing_ud_(v_swing);
+  const uint8_t leftright_bin = encode_swing_lr_(h_swing);
+  tx_bytes_[32] = static_cast<uint8_t>(updown_bin + leftright_bin);
+
+  const uint8_t turbo_bin = d_turbo_ ? 0b00001100 : 0b00000100;
+  const uint8_t eco_bin = d_eco_ ? 0b00110000 : 0b00000000;
+  tx_bytes_[33] = (d_turbo_ ? turbo_bin : (eco_bin ? eco_bin : 0));
+
+  d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
+  tx_bytes_[35] = d_quiet_ ? 0b00110000 : 0b00000000;
+
+  tx_bytes_[36] = d_led_ ? 0b11000000 : 0b01000000;
+
+  // Turbo overrides certain fields per protocol
+  if (d_turbo_) {
+    tx_bytes_[19] = d_target_c_; // turbo mode: do not alter setpoint encoding here
+    tx_bytes_[33] = turbo_bin;
+    tx_bytes_[35] = 0;           // override quiet
+  }
+}
+
+void ACHIClimate::publish_gated_state_() {
+  // Always publish current temperatures from status
+  // Gate only control-related fields depending on accept_remote_changes_
+  if (accept_remote_changes_) {
+    // Publish ACTUAL (remote side allowed)
+    this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
+    this->target_temperature = this->target_c_;
+    this->fan_mode = this->fan_;
+    this->swing_mode = this->swing_;
+    if (enable_presets_) {
+      if (this->turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
+      else if (this->eco_) this->preset = climate::CLIMATE_PRESET_ECO;
+      else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
+      else this->preset = climate::CLIMATE_PRESET_NONE;
+    }
+  } else {
+    // Publish DESIRED (while forcing target)
+    this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
+    this->target_temperature = d_target_c_;
+    this->fan_mode = d_fan_;
+    this->swing_mode = d_swing_;
+    if (enable_presets_) {
+      if (d_turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
+      else if (d_eco_) this->preset = climate::CLIMATE_PRESET_ECO;
+      else if (d_sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
+      else this->preset = climate::CLIMATE_PRESET_NONE;
+    }
+  }
+  this->publish_state();
+}
+
+uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMode mode,
+                                                 climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
+                                                 bool eco, bool turbo, bool quiet, bool led,
+                                                 uint8_t sleep_stage, uint8_t target_c) const {
+  // FNV-1a over normalized control fields (exclude sensor bytes)
+  uint32_t h = 2166136261u;
+  auto mix = [&h](uint32_t x) {
+    h ^= x;
+    h *= 16777619u;
+  };
+  mix(power ? 1u : 0u);
+  mix(static_cast<uint32_t>(mode));
+  mix(static_cast<uint32_t>(fan));
+  mix(static_cast<uint32_t>(swing));
+  mix(eco ? 1u : 0u);
+  mix(turbo ? 1u : 0u);
+  mix(quiet ? 1u : 0u);
+  mix(led ? 1u : 0u);
+  mix(static_cast<uint32_t>(sleep_stage & 0x0Fu));
+  mix(static_cast<uint32_t>(std::max<uint8_t>(16, std::min<uint8_t>(30, target_c))));
+  return h;
+}
+
+void ACHIClimate::recalc_desired_sig_() {
+  desired_sig_ = compute_control_signature_(d_power_on_, d_mode_, d_fan_, d_swing_,
+                                            d_eco_, d_turbo_, d_quiet_, d_led_, d_sleep_stage_, d_target_c_);
+}
+
+void ACHIClimate::recalc_actual_sig_() {
+  actual_sig_ = compute_control_signature_(power_on_, mode_, fan_, swing_,
+                                           eco_, turbo_, quiet_, led_, sleep_stage_, target_c_);
+}
+
+void ACHIClimate::maybe_force_to_target_() {
+  if (!ha_priority_active_) return;
+
+  if (actual_sig_ == desired_sig_) {
+    // Converged to the desired state, unlock remote acceptance
+    ha_priority_active_ = false;
+    accept_remote_changes_ = true;
+    ESP_LOGI(TAG, "Converged to desired HA state; remote changes are accepted again.");
+    return;
+  }
+
+  // Not yet converged — send another write if possible
+  if (!writing_lock_) {
+    ESP_LOGD(TAG, "Enforcing desired HA state (sig_actual=0x%08X != sig_desired=0x%08X) -> WRITE", (unsigned) actual_sig_, (unsigned) desired_sig_);
+    build_tx_from_desired_();
+    writing_lock_ = true;
+    pending_write_ = true;
+    send_write_changes_();
+  } else {
+    ESP_LOGV(TAG, "Write lock active while enforcing target, will retry after ACK/status");
+  }
 }
 
 // ---- Logging helpers ----

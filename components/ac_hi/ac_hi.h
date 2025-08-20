@@ -72,6 +72,17 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
+  // --- Priority/authority helpers ---
+  void build_tx_from_desired_();   // build tx_bytes_ from desired_* fields (no mapping/proto change)
+  void publish_gated_state_();     // publish either desired or actual into HA, sensors always actual
+  void maybe_force_to_target_();   // enforce desired state while HA priority is active
+  uint32_t compute_control_signature_(bool power, climate::ClimateMode mode,
+                                      climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
+                                      bool eco, bool turbo, bool quiet, bool led,
+                                      uint8_t sleep_stage, uint8_t target_c) const;
+  void recalc_desired_sig_();
+  void recalc_actual_sig_();
+
   // Incoming stream buffer (sliding window: rx_start_ — offset of data start)
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
@@ -85,7 +96,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x65, 0x00, 0x00, 0x00, // 0..16
       0x00, // [17] sleep
       0x00, // [18] power+mode
-      0x00, // [19] set temp (°C, direct)
+      0x00, // [19] set temp (°C, direct when decoded on RX; TX uses encode_temp_)
       0x00, // [20] current temp (RO)
       0x00, // [21] pipe temp (RO)
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
@@ -110,7 +121,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0xB3, 0xF4, 0xFB
   };
 
-  // ---- State reflection ----
+  // ---- Actual (parsed from status) state ----
   bool power_on_{false};
   uint8_t target_c_{24}; // 16..30
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
@@ -122,18 +133,28 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool led_{true};
   uint8_t sleep_stage_{0}; // 0..4
 
-  // For suppression of repeating statuses (by byte sum)
-  uint16_t last_status_crc_{0};
+  // ---- Desired (from HA) state ----
+  bool d_power_on_{false};
+  uint8_t d_target_c_{24};
+  climate::ClimateMode d_mode_{climate::CLIMATE_MODE_OFF};
+  climate::ClimateFanMode d_fan_{climate::CLIMATE_FAN_AUTO};
+  climate::ClimateSwingMode d_swing_{climate::CLIMATE_SWING_OFF};
+  bool d_turbo_{false};
+  bool d_eco_{false};
+  bool d_quiet_{false};
+  bool d_led_{true};
+  uint8_t d_sleep_stage_{0};
 
-  // ---- Field encoders ----
-  uint8_t encode_temp_(uint8_t c) {
-    return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
-  }
-  uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
-  uint8_t encode_fan_byte_(climate::ClimateFanMode f);
-  uint8_t encode_sleep_byte_(uint8_t stage);
-  uint8_t encode_swing_ud_(bool on);
-  uint8_t encode_swing_lr_(bool on);
+  // Acceptance/priority flags
+  bool accept_remote_changes_{true};  // when true: apply remote (status) mode changes to HA
+  bool ha_priority_active_{false};    // when true: keep enforcing desired_* until matched
+
+  // Signatures (control-only hash)
+  uint32_t desired_sig_{0};
+  uint32_t actual_sig_{0};
+
+  // For suppression/logging
+  uint16_t last_status_crc_{0};
 
   // Optional pipe sensor
 #ifdef USE_SENSOR
@@ -144,6 +165,21 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Flags
   bool enable_presets_{true};
+
+  // For debugging/analysis
+  std::vector<uint8_t> last_status_frame_;
+  std::vector<uint8_t> last_tx_frame_;
+
+  // ---- Field encoders ----
+  uint8_t encode_temp_(uint8_t c) {
+    // TX setpoint encoding (protocol specific): (value<<1) | 1
+    return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
+  }
+  uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
+  uint8_t encode_fan_byte_(climate::ClimateFanMode f);
+  uint8_t encode_sleep_byte_(uint8_t stage);
+  uint8_t encode_swing_ud_(bool on);
+  uint8_t encode_swing_lr_(bool on);
 
   // ---- Logging helpers ----
   std::string bytes_to_hex_(const std::vector<uint8_t> &b) const;       // formats buffer as HEX string
