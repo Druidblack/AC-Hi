@@ -11,15 +11,24 @@
   #include "esphome/components/sensor/sensor.h"
 #endif
 
+// Include text_sensor header only if the platform is present
+#ifdef USE_TEXT_SENSOR
+  #include "esphome/components/text_sensor/text_sensor.h"
+#endif
+
 #include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
+// Forward declarations for optional platforms
 namespace esphome {
 namespace sensor {
 class Sensor;  // forward declaration if USE_SENSOR is not defined
 }  // namespace sensor
+namespace text_sensor {
+class TextSensor; // forward declaration if USE_TEXT_SENSOR is not defined
+}  // namespace text_sensor
 }  // namespace esphome
 
 namespace esphome {
@@ -68,6 +77,27 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Link LED target switch
   void set_led_switch(ACHILEDTargetSwitch *s) { led_switch_ = s; if (led_switch_) led_switch_->set_parent(this); }
+
+  // Optional sensors setters (created only if present in YAML)
+#ifdef USE_SENSOR
+  void set_set_temperature_sensor(sensor::Sensor *s) { set_temp_sensor_ = s; }
+  void set_room_temperature_sensor(sensor::Sensor *s) { room_temp_sensor_ = s; }
+  void set_wind_sensor(sensor::Sensor *s) { wind_code_sensor_ = s; }
+  void set_sleep_stage_sensor(sensor::Sensor *s) { sleep_code_sensor_ = s; }
+  void set_mode_code_sensor(sensor::Sensor *s) { mode_code_sensor_ = s; }
+  void set_quiet_sensor(sensor::Sensor *s) { quiet_code_sensor_ = s; }
+  void set_turbo_sensor(sensor::Sensor *s) { turbo_code_sensor_ = s; }
+  void set_economy_sensor(sensor::Sensor *s) { eco_code_sensor_ = s; }
+  void set_swing_ud_sensor(sensor::Sensor *s) { swing_ud_sensor_ = s; }
+  void set_swing_lr_sensor(sensor::Sensor *s) { swing_lr_sensor_ = s; }
+  void set_compr_freq_set_sensor(sensor::Sensor *s) { compressor_freq_set_sensor_ = s; }
+  void set_compr_freq_sensor(sensor::Sensor *s) { compressor_freq_sensor_ = s; }
+  void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
+  void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
+#endif
+#ifdef USE_TEXT_SENSOR
+  void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
+#endif
 
   void setup() override;
   void loop() override;
@@ -168,7 +198,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool d_turbo_{false};
   bool d_eco_{false};
   bool d_quiet_{false};
-  bool d_led_{true};  // default ON as requested
+  bool d_led_{true};  // default ON
   uint8_t d_sleep_stage_{0};
 
   // Acceptance/priority flags
@@ -191,6 +221,29 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Optional LED target switch
   ACHILEDTargetSwitch *led_switch_{nullptr};
+
+  // Optional numeric sensors (published from status frames)
+#ifdef USE_SENSOR
+  sensor::Sensor *set_temp_sensor_{nullptr};
+  sensor::Sensor *room_temp_sensor_{nullptr};
+  sensor::Sensor *wind_code_sensor_{nullptr};
+  sensor::Sensor *sleep_code_sensor_{nullptr};
+  sensor::Sensor *mode_code_sensor_{nullptr};
+  sensor::Sensor *quiet_code_sensor_{nullptr};
+  sensor::Sensor *turbo_code_sensor_{nullptr};
+  sensor::Sensor *eco_code_sensor_{nullptr};
+  sensor::Sensor *swing_ud_sensor_{nullptr};
+  sensor::Sensor *swing_lr_sensor_{nullptr};
+  sensor::Sensor *compressor_freq_set_sensor_{nullptr};
+  sensor::Sensor *compressor_freq_sensor_{nullptr};
+  sensor::Sensor *outdoor_temp_sensor_{nullptr};
+  sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
+#endif
+
+  // Optional text sensor (power status ON/OFF)
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *power_status_text_{nullptr};
+#endif
 
   // Flags
   bool enable_presets_{true};

@@ -511,6 +511,28 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   publish_gated_state_();
   update_led_switch_state_();
 
+  // ---- Publish optional sensors (only if configured in YAML) ----
+#ifdef USE_SENSOR
+  if (set_temp_sensor_ != nullptr) set_temp_sensor_->publish_state(bytes[19]);
+  if (room_temp_sensor_ != nullptr) room_temp_sensor_->publish_state(bytes[20]);
+  if (wind_code_sensor_ != nullptr) wind_code_sensor_->publish_state(bytes[16]);
+  if (sleep_code_sensor_ != nullptr) sleep_code_sensor_->publish_state(bytes[17]);
+  if (mode_code_sensor_ != nullptr) mode_code_sensor_->publish_state((bytes[18] >> 4) & 0x0F);
+  if (quiet_code_sensor_ != nullptr) quiet_code_sensor_->publish_state((bytes[36] & 0b00000100) ? 1 : 0);
+  if (turbo_code_sensor_ != nullptr) turbo_code_sensor_->publish_state((bytes[35] & 0b00000010) ? 1 : 0);
+  if (eco_code_sensor_ != nullptr)   eco_code_sensor_->publish_state((bytes[35] & 0b00000100) ? 1 : 0);
+  if (swing_ud_sensor_ != nullptr)   swing_ud_sensor_->publish_state((bytes[35] & 0b10000000) ? 1 : 0);
+  if (swing_lr_sensor_ != nullptr)   swing_lr_sensor_->publish_state((bytes[35] & 0b01000000) ? 1 : 0);
+  if (compressor_freq_set_sensor_ != nullptr) compressor_freq_set_sensor_->publish_state(bytes[42]);
+  if (compressor_freq_sensor_ != nullptr)     compressor_freq_sensor_->publish_state(bytes[43]);
+  if (outdoor_temp_sensor_ != nullptr)        outdoor_temp_sensor_->publish_state(bytes[44]);
+  if (outdoor_cond_temp_sensor_ != nullptr)   outdoor_cond_temp_sensor_->publish_state(bytes[45]);
+#endif
+
+#ifdef USE_TEXT_SENSOR
+  if (power_status_text_ != nullptr) power_status_text_->publish_state(this->power_on_ ? "ON" : "OFF");
+#endif
+
   ESP_LOGV(TAG,
            "Parsed STATUS: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%u°C, sleep_stage=%u, flags{eco=%s,turbo=%s,quiet=%s,led=%s}",
            this->power_on_ ? "ON" : "OFF",
