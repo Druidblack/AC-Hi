@@ -76,9 +76,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void build_tx_from_desired_();   // build tx_bytes_ from desired_* fields (no mapping/proto change)
   void publish_gated_state_();     // publish either desired or actual into HA, sensors always actual
   void maybe_force_to_target_();   // enforce desired state while HA priority is active
+
+  // Control signature ignores sensor bytes and LED (LED is non-critical and may not be echoed)
   uint32_t compute_control_signature_(bool power, climate::ClimateMode mode,
                                       climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
-                                      bool eco, bool turbo, bool quiet, bool led,
+                                      bool eco, bool turbo, bool quiet,
                                       uint8_t sleep_stage, uint8_t target_c) const;
   void recalc_desired_sig_();
   void recalc_actual_sig_();
@@ -150,7 +152,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool accept_remote_changes_{true};  // when true: apply remote (status) mode changes to HA
   bool ha_priority_active_{false};    // when true: keep enforcing desired_* until matched
 
-  // Signatures (control-only hash)
+  // Signatures (control-only hash; LED excluded)
   uint32_t desired_sig_{0};
   uint32_t actual_sig_{0};
 

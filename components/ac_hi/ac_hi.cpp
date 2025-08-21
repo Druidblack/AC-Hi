@@ -446,7 +446,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   ESP_LOGV(TAG, "STATUS: raw_wind=0x%02X (%u)", raw_wind, (unsigned) raw_wind);
   climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
   // Device reports base codes, writes require +1. Recognize base codes here.
-  if (raw_wind == 1 || raw_wind == 2) new_fan = climate::CLIMATE_FAN_AUTO;
+  if (raw_wind == 0 || raw_wind == 1 || raw_wind == 2) new_fan = climate::CLIMATE_FAN_AUTO; // include 0 as fallback
   else if (raw_wind == 10) new_fan = climate::CLIMATE_FAN_QUIET;
   else if (raw_wind == 12) new_fan = climate::CLIMATE_FAN_LOW;
   else if (raw_wind == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
@@ -497,6 +497,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 
   // Publish HA-visible state with gating:
   // - If accept_remote_changes_ == true -> publish ACTUAL (remote changes allowed)
+  //   and sync desired_* to actual_* (so future enforcement won't fight old HA target)
   // - If accept_remote_changes_ == false -> publish DESIRED (but sensors updated)
   publish_gated_state_();
 
@@ -576,6 +577,18 @@ void ACHIClimate::publish_gated_state_() {
       else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
       else this->preset = climate::CLIMATE_PRESET_NONE;
     }
+    // IMPORTANT: when remote changes are accepted, mirror desired_* to actual_*
+    d_power_on_    = power_on_;
+    d_mode_        = mode_;
+    d_target_c_    = target_c_;
+    d_fan_         = fan_;
+    d_swing_       = swing_;
+    d_eco_         = eco_;
+    d_turbo_       = turbo_;
+    d_quiet_       = quiet_;
+    d_led_         = led_;          // keep desired LED equal to actual; LED is excluded from signature
+    d_sleep_stage_ = sleep_stage_;
+    recalc_desired_sig_();
   } else {
     // Publish DESIRED (while forcing target)
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
@@ -594,9 +607,9 @@ void ACHIClimate::publish_gated_state_() {
 
 uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMode mode,
                                                  climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
-                                                 bool eco, bool turbo, bool quiet, bool led,
+                                                 bool eco, bool turbo, bool quiet,
                                                  uint8_t sleep_stage, uint8_t target_c) const {
-  // FNV-1a over normalized control fields (exclude sensor bytes)
+  // FNV-1a over normalized control fields (exclude sensor bytes and LED)
   uint32_t h = 2166136261u;
   auto mix = [&h](uint32_t x) {
     h ^= x;
@@ -609,7 +622,6 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
   mix(eco ? 1u : 0u);
   mix(turbo ? 1u : 0u);
   mix(quiet ? 1u : 0u);
-  mix(led ? 1u : 0u);
   mix(static_cast<uint32_t>(sleep_stage & 0x0Fu));
   mix(static_cast<uint32_t>(std::max<uint8_t>(16, std::min<uint8_t>(30, target_c))));
   return h;
@@ -617,12 +629,12 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
 
 void ACHIClimate::recalc_desired_sig_() {
   desired_sig_ = compute_control_signature_(d_power_on_, d_mode_, d_fan_, d_swing_,
-                                            d_eco_, d_turbo_, d_quiet_, d_led_, d_sleep_stage_, d_target_c_);
+                                            d_eco_, d_turbo_, d_quiet_, d_sleep_stage_, d_target_c_);
 }
 
 void ACHIClimate::recalc_actual_sig_() {
   actual_sig_ = compute_control_signature_(power_on_, mode_, fan_, swing_,
-                                           eco_, turbo_, quiet_, led_, sleep_stage_, target_c_);
+                                           eco_, turbo_, quiet_, sleep_stage_, target_c_);
 }
 
 void ACHIClimate::maybe_force_to_target_() {
@@ -660,7 +672,8 @@ void ACHIClimate::log_sig_diff_() const {
   if (eco_ != d_eco_) ESP_LOGV(TAG, "DIFF eco: actual=%s desired=%s", b2s(eco_), b2s(d_eco_));
   if (turbo_ != d_turbo_) ESP_LOGV(TAG, "DIFF turbo: actual=%s desired=%s", b2s(turbo_), b2s(d_turbo_));
   if (quiet_ != d_quiet_) ESP_LOGV(TAG, "DIFF quiet: actual=%s desired=%s", b2s(quiet_), b2s(d_quiet_));
-  if (led_ != d_led_) ESP_LOGV(TAG, "DIFF led: actual=%s desired=%s", b2s(led_), b2s(d_led_));
+  // LED is intentionally excluded from signature and does not prevent convergence
+  if (led_ != d_led_) ESP_LOGV(TAG, "DIFF led (ignored for convergence): actual=%s desired=%s", b2s(led_), b2s(d_led_));
   if (sleep_stage_ != d_sleep_stage_) ESP_LOGV(TAG, "DIFF sleep_stage: actual=%u desired=%u", (unsigned) sleep_stage_, (unsigned) d_sleep_stage_);
   if (target_c_ != d_target_c_) ESP_LOGV(TAG, "DIFF target_c: actual=%u desired=%u", (unsigned) target_c_, (unsigned) d_target_c_);
 }
