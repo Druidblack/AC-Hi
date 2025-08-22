@@ -20,8 +20,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <algorithm>
 
-// Forward declarations for optional platforms
 namespace esphome {
 namespace sensor {
 class Sensor;  // forward declaration if USE_SENSOR is not defined
@@ -62,6 +62,11 @@ static constexpr uint8_t HI_TAIL1 = 0xFB;
 static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;    // at most 2 frames per loop()
 static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;   // and at most 20 ms parsing budget per loop
 static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // compact RX buffer after consuming >512 bytes
+
+// Memory/diagnostic tuning (no protocol changes)
+static constexpr size_t RX_BUFFER_RESERVE  = 2048; // pre-reserved capacity for RX stream buffer
+static constexpr size_t MAX_FRAME_BYTES    = 96;   // generous upper bound (> typical ~50B)
+static constexpr size_t LOG_BYTES_PER_LINE = 24;   // chunk size for hex dump logging
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -137,7 +142,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
                                       uint8_t sleep_stage, uint8_t target_c) const;
   void recalc_desired_sig_();
   void recalc_actual_sig_();
-  void log_sig_diff_() const;      // verbose: which fields differ (for debugging only)
+  void log_sig_diff_() const;      // verbose: which control fields differ (for debugging only)
 
   // Incoming stream buffer (sliding window: rx_start_ — offset of data start)
   std::vector<uint8_t> rx_;
@@ -263,8 +268,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_swing_lr_(bool on);
 
   // ---- Logging helpers ----
-  std::string bytes_to_hex_(const std::vector<uint8_t> &b) const;       // formats buffer as HEX string
-  void log_frame_(const char *prefix, const std::vector<uint8_t> &b) const; // dumps full frame at VERBOSE level
+  // Hex dump without dynamic heap allocations (chunked lines)
+  void log_frame_(const char *prefix, const std::vector<uint8_t> &b) const;
 };
 
 }  // namespace ac_hi

@@ -2,8 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <string>
-#include <sstream>
-#include <iomanip>
+#include <cstdio>   // snprintf
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -70,6 +69,11 @@ void ACHIClimate::setup() {
   this->publish_state();
   update_led_switch_state_();
 
+  // Pre-reserve buffers to minimize heap churn and fragmentation
+  rx_.reserve(RX_BUFFER_RESERVE);
+  last_status_frame_.reserve(MAX_FRAME_BYTES);
+  last_tx_frame_.reserve(MAX_FRAME_BYTES);
+
   ESP_LOGV(TAG, "Setup completed: defaults published (mode=OFF, target=24°C, fan=AUTO, swing=OFF, desired_led=ON)");
 }
 
@@ -92,6 +96,7 @@ void ACHIClimate::loop() {
   // Sliding window / buffer compaction
   if (rx_start_ > RX_COMPACT_THRESHOLD) {
     ESP_LOGV(TAG, "RX buffer compaction: removing %u bytes", (unsigned) rx_start_);
+    // Erase consumed prefix in-place; capacity remains (avoids reallocation)
     rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
     rx_start_ = 0;
   }
@@ -100,12 +105,12 @@ void ACHIClimate::loop() {
     ESP_LOGV(TAG, "RX buffer large (%u bytes remain). Applying safety trim.", (unsigned) remain);
     if (remain >= 1 && rx_.back() == HI_HDR0) {
       uint8_t keep = rx_.back();
-      rx_.clear();
+      rx_.clear();    // keep capacity; size becomes 0
       rx_.push_back(keep);
       rx_start_ = 0;
       ESP_LOGV(TAG, "Trimmed buffer, kept trailing header byte 0x%02X", keep);
     } else {
-      rx_.clear();
+      rx_.clear();    // keep capacity; size becomes 0
       rx_start_ = 0;
       ESP_LOGV(TAG, "Cleared RX buffer due to overflow");
     }
@@ -315,21 +320,24 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
 }
 
 void ACHIClimate::send_write_changes_() {
-  auto frame = this->tx_bytes_;
-  this->calc_and_patch_crc_(frame);
+  // Patch CRC directly in tx_bytes_ to avoid extra temporary allocations
+  this->calc_and_patch_crc_(tx_bytes_);
   ESP_LOGV(TAG, "TX: sending WRITE frame (0x65)");
-  this->log_frame_("TX", frame);
-  for (auto b : frame) this->write_byte(b);
+  this->log_frame_("TX", tx_bytes_);
+  for (auto b : tx_bytes_) this->write_byte(b);
   this->flush();
 
-  // Keep a copy of the last exact TX frame sent for analysis
-  last_tx_frame_ = std::move(frame);
+  // Keep a copy of the last exact TX frame sent for analysis (capacity pre-reserved)
+  last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
 }
 
 // ---- RX scanner/parser ----
 
 void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
+  // Reuse a pre-reserved frame buffer to reduce heap churn
   std::vector<uint8_t> frame;
+  frame.reserve(MAX_FRAME_BYTES);
+
   uint8_t handled = 0;
   const uint32_t start = esphome::millis();
 
@@ -392,9 +400,11 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     size_t expected_total = static_cast<size_t>(decl) + 9U;
 
     if (rx_.size() >= rx_start_ + expected_total) {
-      frame.insert(frame.end(),
-                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
-                   rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total));
+      // Assign into pre-reserved frame buffer (no reallocation)
+      frame.assign(
+        rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+        rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total)
+      );
       rx_start_ += expected_total;
       ESP_LOGV(TAG, "RX: frame sliced by declared length (decl=%u, total=%u)", (unsigned) decl, (unsigned) expected_total);
       return true;
@@ -412,9 +422,10 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   }
   if (!found_tail) return false;
 
-  frame.insert(frame.end(),
-               rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
-               rx_.begin() + static_cast<std::ptrdiff_t>(j + 2));
+  frame.assign(
+    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+    rx_.begin() + static_cast<std::ptrdiff_t>(j + 2)
+  );
   rx_start_ = j + 2;
   ESP_LOGV(TAG, "RX: frame sliced by tail (pos=%u)", (unsigned) (j + 1));
   return true;
@@ -440,8 +451,8 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
-  // Store the raw frame for diagnostics
-  last_status_frame_ = bytes;
+  // Store the raw frame for diagnostics (pre-reserved)
+  last_status_frame_.assign(bytes.begin(), bytes.end());
 
   // ---- Parse actual device state (do not change mappings to indices) ----
 
@@ -738,18 +749,27 @@ void ACHIClimate::set_desired_led(bool on) {
 
 // ---- Logging helpers ----
 
-std::string ACHIClimate::bytes_to_hex_(const std::vector<uint8_t> &b) const {
-  std::ostringstream oss;
-  oss << std::uppercase << std::hex << std::setfill('0');
-  for (size_t i = 0; i < b.size(); i++) {
-    oss << std::setw(2) << static_cast<unsigned>(b[i]);
-    if (i + 1 < b.size()) oss << ' ';
-  }
-  return oss.str();
-}
-
 void ACHIClimate::log_frame_(const char *prefix, const std::vector<uint8_t> &b) const {
-  ESP_LOGV(TAG, "%s FRAME (%u bytes): %s", prefix, (unsigned) b.size(), this->bytes_to_hex_(b).c_str());
+  // Hex dump with stack buffers to avoid heap fragmentation.
+  // We print header line and then data lines with up to LOG_BYTES_PER_LINE bytes each.
+  char header[64];
+  int hn = snprintf(header, sizeof(header), "%s FRAME (%u bytes)", prefix, (unsigned) b.size());
+  if (hn > 0) {
+    ESP_LOGV(TAG, "%s", header);
+  }
+
+  const size_t n = b.size();
+  size_t i = 0;
+  while (i < n) {
+    char line[8 + (3 * LOG_BYTES_PER_LINE) + 8]; // "0000: " + 3*bytes + safety
+    int pos = snprintf(line, sizeof(line), "%04u: ", (unsigned) i);
+    size_t chunk = std::min(LOG_BYTES_PER_LINE, n - i);
+    for (size_t j = 0; j < chunk && pos < (int)sizeof(line) - 4; j++) {
+      pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", b[i + j]);
+    }
+    ESP_LOGV(TAG, "%s", line);
+    i += chunk;
+  }
 }
 
 } // namespace ac_hi
