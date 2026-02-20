@@ -94,6 +94,7 @@ static constexpr size_t   RX_BUFFER_RESERVE    = 2048;
 static constexpr size_t   MAX_FRAME_BYTES      = 96;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
+static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -166,7 +167,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void build_tx_from_desired_();
   void publish_gated_state_();
   void update_led_switch_state_();
-  void maybe_send_pending_control_();
+  void maybe_force_to_target_();                     // <-- добавлено объявление
+  void maybe_send_pending_control_();                // (опционально, если используется)
 
   // Signatures for convergence detection
   uint32_t compute_control_signature_(bool power, climate::ClimateMode mode,
