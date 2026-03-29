@@ -74,10 +74,10 @@ void ACHIClimate::setup() {
 }
 
 void ACHIClimate::update() {
-  if (!writing_lock_) {
+  if (!writing_lock_ && !pending_control_) {
     send_query_status_();
   } else {
-    ESP_LOGV(TAG, "Polling skipped (write lock active)");
+    ESP_LOGV(TAG, "Polling skipped (write lock active or pending control)");
   }
 }
 
@@ -424,15 +424,21 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_ = climate::CLIMATE_FAN_AUTO;   // when off, fan mode is irrelevant
   }
 
-  // Sleep stage
+  // Sleep stage.
+  // Some units report the live status as direct values 0..4,
+  // while writes still use the encoded form (value<<1)|1.
   uint8_t raw_sleep = b[IDX_SLEEP];
-  uint8_t code = raw_sleep >> 1;
-  if (code == 0) sleep_stage_ = 0;
-  else if (code == 1) sleep_stage_ = 1;
-  else if (code == 2) sleep_stage_ = 2;
-  else if (code == 4) sleep_stage_ = 3;
-  else if (code == 8) sleep_stage_ = 4;
-  else sleep_stage_ = 0;
+  switch (raw_sleep) {
+    case 0x00: sleep_stage_ = 0; break;
+    case 0x01: sleep_stage_ = 1; break;
+    case 0x02: sleep_stage_ = 2; break;
+    case 0x03: sleep_stage_ = 1; break;
+    case 0x04: sleep_stage_ = 3; break;
+    case 0x05: sleep_stage_ = 2; break;
+    case 0x09: sleep_stage_ = 3; break;
+    case 0x11: sleep_stage_ = 4; break;
+    default:   sleep_stage_ = 0; break;
+  }
 
   // Target temperature (direct value)
   target_c_ = b[IDX_SET_TEMP];
@@ -597,13 +603,18 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
   // In OFF state many indoor units keep reporting the last active mode while power is already off.
   // Normalize non-power fields so we do not get stuck in an endless enforce/write loop.
   if (!power) {
+    // In OFF state this indoor unit may keep the last active mode/temperature/fan
+    // in the status frame. Treat OFF as a single converged state so HA does not
+    // keep re-sending power-off frames and block a later remote power-on.
     mode = climate::CLIMATE_MODE_OFF;
     fan = climate::CLIMATE_FAN_AUTO;
     swing = climate::CLIMATE_SWING_OFF;
     eco = false;
     turbo = false;
     quiet = false;
+    led = true;
     sleep_stage = 0;
+    target_c = 24;
   }
 
   // If LED switch is not configured, ignore LED bit in convergence logic.
