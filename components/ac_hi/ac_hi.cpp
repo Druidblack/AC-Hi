@@ -198,10 +198,16 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
+    bool was_turbo = d_turbo_;
 
     d_eco_ = false;
     d_turbo_ = false;
     d_sleep_stage_ = 0;
+
+    // Leaving Turbo should restore AUTO fan unless a new preset overrides it.
+    if (was_turbo && p != climate::CLIMATE_PRESET_BOOST) {
+      d_fan_ = climate::CLIMATE_FAN_AUTO;
+    }
 
     if (p == climate::CLIMATE_PRESET_ECO) {
       d_eco_ = true;
@@ -507,8 +513,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   quiet_ = (b[IDX_RX_QUIET] & QUIET_MASK) != 0;   // byte 36 in status frame
   led_   = (b[IDX_RX_LED] & LED_MASK) != 0;       // byte 37 in status frame
 
-  // Turbo uses a dedicated fan code on this platform.
-  if (turbo_ && raw_wind == 18) {
+  // On this model Quiet is signaled by the quiet flag, while raw_wind may remain 2.
+  if (quiet_) {
+    fan_ = climate::CLIMATE_FAN_QUIET;
+  } else if (turbo_ && raw_wind == 18) {
+    // Turbo uses a dedicated fan code on this platform.
     fan_ = (mode_ == climate::CLIMATE_MODE_HEAT) ? climate::CLIMATE_FAN_AUTO
                                                  : climate::CLIMATE_FAN_HIGH;
   }
