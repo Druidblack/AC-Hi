@@ -48,10 +48,18 @@ enum FrameIndex : uint8_t {
   IDX_SET_TEMP = 19,
   IDX_CURRENT_TEMP = 20,
   IDX_PIPE_TEMP = 21,
-  IDX_SWING = 32,
-  IDX_TURBO_ECO = 33,
-  IDX_QUIET = 35,
-  IDX_LED = 36,
+
+  // Write-frame indexes.
+  IDX_TX_SWING = 32,
+  IDX_TX_TURBO_ECO = 33,
+  IDX_TX_QUIET = 35,
+  IDX_TX_LED = 36,
+
+  // Status-frame indexes.
+  IDX_RX_SWING_TURBO_ECO = 35,
+  IDX_RX_QUIET = 36,
+  IDX_RX_LED = 37,
+
   IDX_COMP_FREQ_SET = 42,
   IDX_COMP_FREQ = 43,
   IDX_OUTDOOR_TEMP = 44,

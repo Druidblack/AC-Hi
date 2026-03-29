@@ -82,9 +82,12 @@ void ACHIClimate::update() {
 }
 
 void ACHIClimate::loop() {
-  // 1. Accumulate incoming bytes
+  // 1. Accumulate incoming bytes without provoking UART timeout logs when no data is available.
   uint8_t c;
-  while (read_byte(&c)) {
+  while (available() > 0) {
+    if (!read_byte(&c)) {
+      break;
+    }
     rx_.push_back(c);
   }
 
@@ -244,19 +247,19 @@ void ACHIClimate::build_tx_from_desired_() {
   bool h = (d_swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
   uint8_t updown = v ? TxValues::UPDOWN_ON : TxValues::UPDOWN_OFF;
   uint8_t leftright = h ? TxValues::LEFTRIGHT_ON : TxValues::LEFTRIGHT_OFF;
-  tx_bytes_[IDX_SWING] = updown + leftright;
+  tx_bytes_[IDX_TX_SWING] = updown + leftright;
 
   // Turbo, Eco, Quiet (bytes 33 and 35) – Turbo has priority
   if (d_turbo_) {
-    tx_bytes_[IDX_TURBO_ECO] = TxValues::TURBO_ON;
-    tx_bytes_[IDX_QUIET] = TxValues::QUIET_OFF;   // Turbo disables quiet
+    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_ON;
+    tx_bytes_[IDX_TX_QUIET] = TxValues::QUIET_OFF;   // Turbo disables quiet
   } else {
-    tx_bytes_[IDX_TURBO_ECO] = TxValues::TURBO_OFF + (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF);
-    tx_bytes_[IDX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
+    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_OFF + (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF);
+    tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
   }
 
   // LED (byte 36)
-  tx_bytes_[IDX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
+  tx_bytes_[IDX_TX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
 }
 
 // ---- Send status query ----
@@ -443,15 +446,15 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   // Turbo, Eco, Quiet, LED
-  uint8_t b35 = b[IDX_TURBO_ECO];   // byte 35 (turbo/eco flags)
-  turbo_ = (b35 & TURBO_MASK) != 0;
-  eco_   = (b35 & ECO_MASK) != 0;
-  quiet_ = (b[IDX_QUIET] & QUIET_MASK) != 0;   // byte 36
-  led_   = (b[IDX_LED] & LED_MASK) != 0;       // byte 37
+  uint8_t features = b[IDX_RX_SWING_TURBO_ECO];   // byte 35 in status frame
+  turbo_ = (features & TURBO_MASK) != 0;
+  eco_   = (features & ECO_MASK) != 0;
+  quiet_ = (b[IDX_RX_QUIET] & QUIET_MASK) != 0;   // byte 36 in status frame
+  led_   = (b[IDX_RX_LED] & LED_MASK) != 0;       // byte 37 in status frame
 
   // Swing
-  bool updown = (b35 & UPDOWN_MASK) != 0;
-  bool leftright = (b35 & LEFTRIGHT_MASK) != 0;
+  bool updown = (features & UPDOWN_MASK) != 0;
+  bool leftright = (features & LEFTRIGHT_MASK) != 0;
   if (updown && leftright) swing_ = climate::CLIMATE_SWING_BOTH;
   else if (updown) swing_ = climate::CLIMATE_SWING_VERTICAL;
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
@@ -591,6 +594,23 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
                                                  climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
                                                  bool eco, bool turbo, bool quiet, bool led,
                                                  uint8_t sleep_stage, uint8_t target_c) const {
+  // In OFF state many indoor units keep reporting the last active mode while power is already off.
+  // Normalize non-power fields so we do not get stuck in an endless enforce/write loop.
+  if (!power) {
+    mode = climate::CLIMATE_MODE_OFF;
+    fan = climate::CLIMATE_FAN_AUTO;
+    swing = climate::CLIMATE_SWING_OFF;
+    eco = false;
+    turbo = false;
+    quiet = false;
+    sleep_stage = 0;
+  }
+
+  // If LED switch is not configured, ignore LED bit in convergence logic.
+  if (led_switch_ == nullptr) {
+    led = true;
+  }
+
   uint32_t h = 2166136261u;
   auto mix = [&h](uint32_t x) {
     h ^= x;
