@@ -257,10 +257,15 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         d_fan_ = climate::CLIMATE_FAN_HIGH;
       }
     } else if (p == climate::CLIMATE_PRESET_SLEEP) {
-      d_sleep_stage_ = 1;
+      // Match the behavior observed from the remote:
+      // SLEEP uses QUIET fan, target temperature increases by 1°C,
+      // and the status frame reports sleep code 2 / 4 rather than 1.
+      if (d_target_c_ < 30) {
+        d_target_c_ += 1;
+      }
+      d_sleep_stage_ = 2;
       d_quiet_ = false;
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
-        d_fan_ = climate::CLIMATE_FAN_AUTO;
+      d_fan_ = climate::CLIMATE_FAN_QUIET;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
