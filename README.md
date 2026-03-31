@@ -1,8 +1,8 @@
 # ESPHome AC component for Hisense CITY DC Inverter, (AS-13UW4RYRCM04G/04W) (RS-485)
 
-<img width="1381" height="913" alt="Interface preview" src="https://github.com/user-attachments/assets/5b765094-464f-4cfc-8cbe-eecd8c11de7c" />
+![primer](https://github.com/user-attachments/assets/1ad2cd3d-0561-4a50-bdaf-25f950640be8)
 
-This custom component provides full climate control for air conditioners manufactured by Hisense and its OEM brands (Ballu, etc.) that use the RS-485 protocol. It has been tested on **Ballu iGreen Pro (BSAGI-12HN8)** and should work with many other models.
+This custom component provides full climate control for air conditioners manufactured by Hisense and its OEM brands (Ballu, etc.) that use the RS-485 protocol. It has been tested on **Hisense CITY DC Inverter AS-13UW4RYRCM04G/04W** and should work with many other models.
 
 The component exposes a standard Home Assistant Climate entity, along with a set of optional sensors and switches to access all advanced features of the AC (turbo, eco, quiet, sleep, swing, LED, etc.).
 
@@ -28,7 +28,8 @@ If you have contributed to the reverse engineering effort or improved the compon
 
 > ⚠️ The AC uses 5V logic levels on its RS‑485 port. Make sure your transceiver is 3.3V‑tolerant if you power the ESP from 3.3V.
 
-![as6yvpi2AeqCNYRhDz0fXO35MZRrYUvdRQsFswfFAja1](https://github.com/user-attachments/assets/020c53af-f625-4c67-b624-0923f904de1f)
+<img width="1055" height="1053" alt="image" src="https://github.com/user-attachments/assets/933c420f-395c-4ee8-a7df-6d1056cbf31e" />
+
 
 ## Installation
 
@@ -38,11 +39,8 @@ Add the following to your ESPHome YAML configuration:
 
 ```yaml
 external_components:
-  - source:
-      type: git
-      url: https://github.com/artshevchenko/ac_hi
-      ref: main
-    components: [ ac_hi ]
+  - source: github://Druidblack/AC-Hi
+    refresh: 30s
 ```
 
 ## Example configuration
@@ -50,20 +48,25 @@ external_components:
 A minimal configuration with all optional sensors and switches:
 
 ```yaml
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
 uart:
   id: ac_uart
-  tx_pin: 16
-  rx_pin: 17
+  tx_pin: 17
+  rx_pin: 16
   baud_rate: 9600
   stop_bits: 1
 
 external_components:
-  - source: github://artshevchenko/AC-Hi
+  - source: github://Druidblack/AC-Hi
     refresh: 30s
 
 climate:
   - platform: ac_hi
-    name: "Ballu AC"
+    name: "Hisense AC"
     uart_id: ac_uart
     update_interval: 2s
     enable_presets: true
@@ -210,7 +213,8 @@ climate:
 
 ## Entities provided
 
-<img width="1361" height="812" alt="Interface preview" src="https://github.com/user-attachments/assets/eb84a052-c4aa-41c9-9f14-46581e9eddc6" />
+![prim2](https://github.com/user-attachments/assets/647b9e77-d2eb-46f5-b0de-94c4a47e6b8c)
+
 
 
 ### Climate (`climate`)
