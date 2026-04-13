@@ -53,6 +53,10 @@ esp32:
   framework:
     type: arduino
 
+logger:
+  level: DEBUG
+  baud_rate: 0
+
 uart:
   id: ac_uart
   tx_pin: 17
