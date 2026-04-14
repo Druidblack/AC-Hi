@@ -356,3 +356,10 @@ frame[frame.size() - 3] = crc & 0xFF;
 ## Contributing
 
 Issues and pull requests are welcome. Please ensure your code follows the ESPHome style and includes appropriate logging.
+
+## 3d case
+
+![photo_2026-04-14_21-47-31](https://github.com/user-attachments/assets/c2c558ee-934a-4680-b14d-c3dfddc8d091)
+![photo_2026-04-14_21-47-30](https://github.com/user-attachments/assets/b8767bfc-5271-4fe3-9ac7-44be30ae4a80)
+![photo_2026-04-14_21-47-30 (2)](https://github.com/user-attachments/assets/ad7305b5-b707-455b-aa96-bc66bff0ad49)
+
