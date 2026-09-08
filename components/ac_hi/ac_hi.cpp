@@ -2596,11 +2596,13 @@ void ACHIClimate::update_led_switch_state_() {
   // Dependency: when the display switch is OFF, command sound must stay ON.
   // With this indoor unit, keeping the display off during user climate commands
   // requires sending LED_OFF, and that action can itself make the unit beep.
-  if (!d_led_ && !command_sound_enabled_) {
-    command_sound_enabled_ = true;
-    ESP_LOGD(TAG, "Command sound forced ON because display switch is OFF");
-    update_sound_switch_state_();
-  }
+
+  // I don't need it. Want quit and dark!
+  // if (!d_led_ && !command_sound_enabled_) {
+  //   command_sound_enabled_ = true;
+  //   ESP_LOGD(TAG, "Command sound forced ON because display switch is OFF");
+  //   update_sound_switch_state_();
+  // }
 
   if (led_switch_ == nullptr) return;
   led_switch_->publish_state(d_led_);
@@ -2819,11 +2821,12 @@ void ACHIClimate::set_desired_led(bool on) {
 
   // Dependency: turning the display OFF also turns command sound ON.
   // This keeps HA from showing an unsupported combination for this protocol.
-  if (!on && !command_sound_enabled_) {
-    command_sound_enabled_ = true;
-    ESP_LOGD(TAG, "Command sound forced ON because display switch was turned OFF");
-    update_sound_switch_state_();
-  }
+  // I don't need it. Want quit and dark!
+  // if (!on && !command_sound_enabled_) {
+  //   command_sound_enabled_ = true;
+  //   ESP_LOGD(TAG, "Command sound forced ON because display switch was turned OFF");
+  //   update_sound_switch_state_();
+  // }
 
   led_command_pending_ = true;
   pending_command_fields_ |= CMD_FIELD_LED;
