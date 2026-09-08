@@ -2867,15 +2867,16 @@ void ACHIClimate::set_memory_mode_enabled(bool on) {
 }
 
 void ACHIClimate::set_command_sound_enabled(bool on) {
-  if (!on && !d_led_) {
-    // The display is currently desired OFF. In this state user commands need
-    // LED_OFF to keep the panel dark, and LED_OFF is audible on this unit.
-    // Keep the sound switch ON so the UI reflects the real supported state.
-    command_sound_enabled_ = true;
-    update_sound_switch_state_();
-    ESP_LOGD(TAG, "Command sound stays ON while display switch is OFF");
-    return;
-  }
+  // I don't need it. Want quit and dark!
+  // if (!on && !d_led_) {
+  //   // The display is currently desired OFF. In this state user commands need
+  //   // LED_OFF to keep the panel dark, and LED_OFF is audible on this unit.
+  //   // Keep the sound switch ON so the UI reflects the real supported state.
+  //   command_sound_enabled_ = true;
+  //   update_sound_switch_state_();
+  //   ESP_LOGD(TAG, "Command sound stays ON while display switch is OFF");
+  //   return;
+  // }
 
   command_sound_enabled_ = on;
   update_sound_switch_state_();
