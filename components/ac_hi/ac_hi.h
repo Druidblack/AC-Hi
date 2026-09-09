@@ -300,6 +300,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Legacy YAML key `compressor_frequency`; retained as an alias for byte 43.
   void set_compr_freq_sensor(sensor::Sensor *s) { compressor_freq_sensor_ = s; }
   void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
+  void set_power_sensor(sensor::Sensor *s) { power_sensor_ = s; }
+  void set_voltage_sensor(sensor::Sensor *s) { voltage_sensor_ = s; }
+  void set_current_sensor(sensor::Sensor *s) { current_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
   void set_compressor_exhaust_temp_sensor(sensor::Sensor *s) { compressor_exhaust_temp_sensor_ = s; }
   void set_indoor_humidity_setting_sensor(sensor::Sensor *s) { indoor_humidity_setting_sensor_ = s; }
@@ -624,6 +627,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Legacy byte-43 sensor configured through `compressor_frequency`.
   sensor::Sensor *compressor_freq_sensor_{nullptr};
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
+  sensor::Sensor *power_sensor_{nullptr};
+  sensor::Sensor *voltage_sensor_{nullptr};
+  sensor::Sensor *current_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
   sensor::Sensor *compressor_exhaust_temp_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_setting_sensor_{nullptr};

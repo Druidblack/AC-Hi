@@ -64,6 +64,9 @@ CONF_COMP_FR_COMMAND = "compressor_frequency_command"
 # Backward-compatible alias for byte 43 used by older YAML configurations.
 CONF_COMP_FR = "compressor_frequency"
 CONF_OUTDOOR_TEMP = "outdoor_temperature"
+CONF_POWER = "power"
+CONF_VOLTAGE = "voltage"
+CONF_CURRENT = "current"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
 CONF_COMPRESSOR_EXHAUST_TEMP = "compressor_exhaust_temperature"
 
@@ -156,6 +159,16 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         unit_of_measurement="Hz",
         accuracy_decimals=0,
         icon="mdi:sine-wave",
+    ),
+    # Electrical data (long status frame only; see README "Status response")
+    cv.Optional(CONF_POWER, default={CONF_NAME: "Power"}): sensor.sensor_schema(
+        unit_of_measurement="W", device_class="power", state_class="measurement", accuracy_decimals=0,
+    ),
+    cv.Optional(CONF_VOLTAGE, default={CONF_NAME: "Voltage"}): sensor.sensor_schema(
+        unit_of_measurement="V", device_class="voltage", state_class="measurement", accuracy_decimals=0,
+    ),
+    cv.Optional(CONF_CURRENT, default={CONF_NAME: "Current"}): sensor.sensor_schema(
+        unit_of_measurement="A", device_class="current", state_class="measurement", accuracy_decimals=0,
     ),
     cv.Optional(CONF_OUTDOOR_TEMP, default={CONF_NAME: "Temperature Outdoor"}): sensor.sensor_schema(
         unit_of_measurement="°C",
@@ -343,6 +356,12 @@ async def to_code(config):
     if conf := config.get(CONF_COMP_FR):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compr_freq_sensor(sens))
+
+    for key, setter in ((CONF_POWER, "set_power_sensor"), (CONF_VOLTAGE, "set_voltage_sensor"),
+                        (CONF_CURRENT, "set_current_sensor")):
+        if conf := config.get(key):
+            sens = await sensor.new_sensor(conf)
+            cg.add(getattr(var, setter)(sens))
 
     if conf := config.get(CONF_OUTDOOR_TEMP):
         sens = await sensor.new_sensor(conf)
