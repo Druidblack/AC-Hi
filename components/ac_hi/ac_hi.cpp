@@ -167,6 +167,12 @@ void ACHISleepProgramSelect::control(const std::string &value) {
 // ---- ACHIClimate implementation ----
 
 void ACHIClimate::setup() {
+  for (GPIOPin *p : {flow_control_pin_, de_pin_, re_pin_}) {
+    if (p != nullptr) {
+      p->setup();
+      p->digital_write(false);  // receive
+    }
+  }
   // Register custom presets on the Climate entity, not on ClimateTraits.
   // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
   if (enable_presets_) {
@@ -1402,8 +1408,10 @@ void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const
              (unsigned) logical.size(), (unsigned) wire.size());
     log_frame_("TX wire", wire);
   }
+  rs485_tx_(true);
   for (auto b : wire) write_byte(b);
   flush();
+  rs485_tx_(false);
 }
 
 // ---- RX frame parsing ----

@@ -1,8 +1,12 @@
 import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
+from esphome import pins
 from esphome.components import climate, uart, sensor, binary_sensor, switch, select, text_sensor, remote_base
-from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC, ICON_LIGHTBULB
+from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC, ICON_LIGHTBULB, CONF_FLOW_CONTROL_PIN
+
+CONF_DE_PIN = "de_pin"
+CONF_RE_PIN = "re_pin"
 
 AUTO_LOAD = ["climate", "uart", "sensor", "binary_sensor", "switch", "select", "text_sensor", "remote_base"]
 
@@ -87,6 +91,10 @@ CONF_PSRAM_FREE = "psram_free"
 CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     **BASE_CLIMATE_EXTRA,
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
+    # RS-485 direction control for transceivers without auto-direction
+    cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
+    cv.Optional(CONF_DE_PIN): pins.gpio_output_pin_schema,
+    cv.Optional(CONF_RE_PIN): pins.gpio_output_pin_schema,
     cv.Optional(CONF_IR_TRANSMITTER_ID): cv.use_id(remote_base.RemoteTransmitterBase),
     cv.Optional(CONF_IFEEL_MQTT_TOPIC): cv.string_strict,
     cv.Optional(CONF_IFEEL_MQTT_PAYLOAD, default="hex"): cv.one_of("hex", "json", lower=True),
@@ -288,6 +296,12 @@ async def to_code(config):
     cg.add(var.set_uart_parent(uart_comp))
 
     cg.add(var.set_enable_presets(config[CONF_ENABLE_PRESETS]))
+
+    for key, setter in ((CONF_FLOW_CONTROL_PIN, "set_flow_control_pin"),
+                        (CONF_DE_PIN, "set_de_pin"), (CONF_RE_PIN, "set_re_pin")):
+        if key in config:
+            pin = await cg.gpio_pin_expression(config[key])
+            cg.add(getattr(var, setter)(pin))
 
     if tx_id := config.get(CONF_IR_TRANSMITTER_ID):
         tx = await cg.get_variable(tx_id)

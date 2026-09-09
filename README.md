@@ -37,6 +37,16 @@ The component exposes a standard Home Assistant Climate entity, along with a set
 
 > ⚠️ The AC uses 5V logic levels on its RS‑485 port. Make sure your transceiver is 3.3V‑tolerant if you power the ESP from 3.3V.
 
+Transceivers with automatic direction switching (TXD/RXD only) need no extra wiring. A bare MAX485 (DI/DE/RE/RO pins) needs the driver enabled while transmitting: wire DE and RE together to one GPIO and set `flow_control_pin`, or keep them separate and set `de_pin` and `re_pin`. The component drives the pin(s) HIGH for the duration of each frame and LOW otherwise.
+
+```yaml
+climate:
+  - platform: ac_hi
+    # ...
+    flow_control_pin: GPIO21   # DE + RE bridged
+    # or: de_pin: GPIO21 / re_pin: GPIO17
+```
+
 <img width="1055" height="1053" alt="image" src="https://github.com/user-attachments/assets/933c420f-395c-4ee8-a7df-6d1056cbf31e" />
 
 
